@@ -1,0 +1,17 @@
+node_modules/
+dist/
+release/
+research/
+coverage/
+.vite/
+*.AppImage
+*.dmg
+*.exe
+*.blockmap
+latest*.yml
+
+# local data
+*.log
+.DS_Store
+.env
+.env.*
