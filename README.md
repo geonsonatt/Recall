@@ -66,6 +66,12 @@ npm run build
 npm test
 ```
 
+Очистка сгенерированных артефактов:
+
+```bash
+npm run clean
+```
+
 ## Передать другу на тест
 
 Собрать установщик (без Git):
@@ -112,6 +118,15 @@ npm run release:manifest -- --base-url https://your-domain.example/recall/<versi
 ```txt
 https://your-domain.example/recall/<version>/update-manifest.json
 ```
+
+## GitHub workflow
+
+- `main` хранит только исходники (без `dist/`, `release/`, `node_modules/`).
+- CI (`.github/workflows/ci.yml`) запускает `npm ci`, `npm test`, `npm run build`.
+- Релиз по тегу `v*` (`.github/workflows/release.yml`):
+  - собирает AppImage,
+  - генерирует `release/update-manifest.json`,
+  - публикует asset в GitHub Release.
 
 ### Формат манифеста
 

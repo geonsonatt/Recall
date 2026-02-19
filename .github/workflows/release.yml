@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build release artifact
+        run: npm run dist
+
+      - name: Build update manifest for this tag
+        run: |
+          npm run release:manifest -- --base-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.AppImage
+            release/latest-linux.yml
+            release/update-manifest.json
+          generate_release_notes: true
