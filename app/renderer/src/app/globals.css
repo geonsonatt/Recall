@@ -2297,6 +2297,21 @@ button:focus-visible {
   gap: 8px;
 }
 
+.insights-ai-config-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.insights-ai-config-grid-model {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.insights-ai-task {
+  min-height: 110px;
+  resize: vertical;
+}
+
 .insights-prompt-hints {
   display: flex;
   flex-wrap: wrap;
@@ -2310,6 +2325,25 @@ button:focus-visible {
 .insights-ai-result {
   display: grid;
   gap: 10px;
+}
+
+.insights-ai-warning {
+  border: 1px solid #e4d4aa;
+  border-radius: 10px;
+  background: #fff8e8;
+  color: #654d18;
+  padding: 8px 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.insights-ai-warning code {
+  display: inline-block;
+  width: fit-content;
+  border: 1px solid #dac28c;
+  border-radius: 8px;
+  background: #fff4d8;
+  padding: 3px 8px;
 }
 
 .insights-recommendations {
@@ -2369,6 +2403,11 @@ button:focus-visible {
   }
 
   .insights-ai-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .insights-ai-config-grid,
+  .insights-ai-config-grid-model {
     grid-template-columns: minmax(0, 1fr);
   }
 }

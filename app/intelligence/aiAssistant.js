@@ -6,6 +6,41 @@ const cleanHighlightTextFromInsights =
     ? insights.__private.cleanHighlightText
     : null;
 
+const DEFAULT_API_URL = normalizeInlineText(
+  process.env.RECALL_AI_API_URL || 'https://api.arliai.com/v1/chat/completions',
+);
+const FREE_DEFAULT_API_MODEL = normalizeInlineText(
+  process.env.RECALL_AI_MODEL || 'Gemma-3-27B-ArliAI-RPMax-v3',
+);
+const EMBEDDED_AI_API_KEY = 'e9420850-87de-44f3-967a-eb43023a9656';
+const FREE_MODEL_ALIASES = [
+  'Gemma-3-27B-ArliAI-RPMax-v3',
+];
+
+const DEPTH_PRESETS = {
+  quick: {
+    evidenceLimit: 14,
+    numCtx: 6144,
+    maxOutputTokens: 900,
+    promptBudget: 12500,
+    maxActions: 6,
+  },
+  balanced: {
+    evidenceLimit: 24,
+    numCtx: 12288,
+    maxOutputTokens: 1400,
+    promptBudget: 19000,
+    maxActions: 8,
+  },
+  deep: {
+    evidenceLimit: 40,
+    numCtx: 22528,
+    maxOutputTokens: 2200,
+    promptBudget: 32000,
+    maxActions: 10,
+  },
+};
+
 const STOP_WORDS = new Set([
   'и',
   'в',
@@ -61,7 +96,7 @@ const STOP_WORDS = new Set([
   'its',
 ]);
 
-function normalizeText(value) {
+function normalizeInlineText(value) {
   return String(value ?? '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -95,10 +130,10 @@ function cleanOcrText(value) {
     .replace(/[‐‑‒–—]/g, '-')
     .replace(/[“”«»„]/g, '"')
     .replace(/[‘’]/g, "'")
-    .replace(/([\p{L}\p{N}])-\s*\n\s*([\p{L}\p{N}])/gu, '$1$2')
-    .replace(/([\p{Ll}])\n(?=[\p{Ll}])/gu, '$1 ')
+    .replace(/([\p{L}\p{N}])[-‐‑]\s*\n\s*([\p{L}\p{N}])/gu, '$1$2')
+    .replace(/([\p{Ll}\d])\n(?=[\p{Ll}\d])/gu, '$1 ')
     .replace(/\n(?=[,.;:!?])/g, ' ')
-    .replace(/\s{2,}/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
     .trim();
 }
 
@@ -124,7 +159,7 @@ function toIsoOrNull(value) {
 }
 
 function truncateText(value, max = 260) {
-  const normalized = normalizeText(value);
+  const normalized = normalizeInlineText(value);
   if (normalized.length <= max) {
     return normalized;
   }
@@ -135,19 +170,37 @@ function resolveDocumentIds(options = {}) {
   if (Array.isArray(options.documentIds) && options.documentIds.length > 0) {
     return [...new Set(options.documentIds.map((id) => String(id)).filter(Boolean))];
   }
-  const documentId = normalizeText(options.documentId);
+
+  const documentId = normalizeInlineText(options.documentId);
   if (documentId) {
     return [documentId];
   }
+
   return undefined;
 }
 
 function getReadingMode(modeRaw) {
-  const mode = normalizeText(modeRaw).toLowerCase();
-  if (mode === 'review' || mode === 'focus') {
+  const mode = normalizeInlineText(modeRaw).toLowerCase();
+  if (mode === 'focus' || mode === 'review') {
     return mode;
   }
   return 'research';
+}
+
+function getAnalysisDepth(depthRaw) {
+  const depth = normalizeInlineText(depthRaw).toLowerCase();
+  if (depth === 'quick' || depth === 'deep') {
+    return depth;
+  }
+  return 'balanced';
+}
+
+function resolveProvider(providerRaw) {
+  const provider = normalizeInlineText(providerRaw).toLowerCase();
+  if (provider === 'local' || provider === 'api') {
+    return provider;
+  }
+  return 'auto';
 }
 
 function stemToken(token) {
@@ -178,8 +231,6 @@ function stemToken(token) {
     'ия',
     'ие',
     'ии',
-    'иям',
-    'ием',
     'ую',
     'юю',
     'ая',
@@ -260,15 +311,14 @@ function cosineSimilarity(left, right) {
 }
 
 function buildTrigramSet(value) {
-  const normalized = normalizeText(value).toLowerCase();
-  const compact = normalized.replace(/\s+/g, ' ');
-  if (compact.length < 3) {
-    return new Set(compact ? [compact] : []);
+  const normalized = normalizeInlineText(value).toLowerCase().replace(/\s+/g, ' ');
+  if (normalized.length < 3) {
+    return new Set(normalized ? [normalized] : []);
   }
 
   const set = new Set();
-  for (let index = 0; index <= compact.length - 3; index += 1) {
-    set.add(compact.slice(index, index + 3));
+  for (let index = 0; index <= normalized.length - 3; index += 1) {
+    set.add(normalized.slice(index, index + 3));
   }
   return set;
 }
@@ -289,16 +339,8 @@ function jaccardSimilarity(leftSet, rightSet) {
   if (union <= 0) {
     return 0;
   }
-  return overlap / union;
-}
 
-function buildQuestionProfile(questionRaw) {
-  const question = cleanOcrText(questionRaw);
-  return {
-    question,
-    tokenVector: buildTokenVector(question),
-    trigramSet: buildTrigramSet(question),
-  };
+  return overlap / union;
 }
 
 function cleanHighlightTextSafe(highlight) {
@@ -319,6 +361,17 @@ function createDocumentMap(db) {
   return map;
 }
 
+function getDocumentProgress(document) {
+  const totalPages = Math.max(0, Number(document?.lastReadTotalPages || 0));
+  const maxReadPage = Math.max(0, Number(document?.maxReadPageIndex || 0) + 1);
+  const percent = totalPages > 0 ? Math.min(100, Math.round((maxReadPage / totalPages) * 100)) : 0;
+  return {
+    totalPages,
+    maxReadPage,
+    percent,
+  };
+}
+
 function collectHighlightContext(db, documentIds) {
   const documentMap = createDocumentMap(db);
   const documents = Array.isArray(db?.documents) ? db.documents : [];
@@ -331,11 +384,25 @@ function collectHighlightContext(db, documentIds) {
   const nowTs = Date.now();
 
   const entries = [];
-  const topTagsMap = new Map();
-  const topDocumentsMap = new Map();
+  const tagFrequency = new Map();
+  const conceptFrequency = new Map();
+  const documentsStats = new Map();
+
   let withNotes = 0;
   let withTags = 0;
   let inboxCount = 0;
+
+  for (const document of filteredDocuments) {
+    const documentId = String(document.id || '');
+    documentsStats.set(documentId, {
+      documentId,
+      title: normalizeInlineText(document.title || documentId),
+      highlights: 0,
+      notes: 0,
+      tagged: 0,
+      progress: getDocumentProgress(document),
+    });
+  }
 
   for (const highlight of highlights) {
     const documentId = String(highlight?.documentId || '');
@@ -350,7 +417,7 @@ function collectHighlightContext(db, documentIds) {
 
     const note = cleanOcrText(highlight?.note || '');
     const tags = Array.isArray(highlight?.tags)
-      ? [...new Set(highlight.tags.map((item) => normalizeText(item).toLowerCase()).filter(Boolean))]
+      ? [...new Set(highlight.tags.map((item) => normalizeInlineText(item).toLowerCase()).filter(Boolean))]
       : [];
 
     if (note) {
@@ -368,17 +435,38 @@ function collectHighlightContext(db, documentIds) {
       ? Math.max(0, (nowTs - new Date(createdAt).valueOf()) / (24 * 60 * 60 * 1000))
       : 180;
 
-    const lengthSignal = Math.min(1, normalizeText(text).length / 360);
-    const noteSignal = note ? 0.26 : 0;
-    const tagSignal = Math.min(0.2, tags.length * 0.07);
-    const reviewSignal = Math.min(0.18, Math.max(0, Number(highlight?.reviewCount || 0)) * 0.03);
-    const recencySignal = Math.max(0, 0.2 - Math.min(0.2, ageDays / 240));
-    const baseQuality = 0.3 + lengthSignal * 0.36 + noteSignal + tagSignal + reviewSignal + recencySignal;
+    const lengthSignal = Math.min(1, normalizeInlineText(text).length / 360);
+    const noteSignal = note ? 0.24 : 0;
+    const tagSignal = Math.min(0.22, tags.length * 0.07);
+    const reviewSignal = Math.min(0.2, Math.max(0, Number(highlight?.reviewCount || 0)) * 0.03);
+    const recencySignal = Math.max(0, 0.24 - Math.min(0.24, ageDays / 240));
+    const baseQuality = 0.28 + lengthSignal * 0.34 + noteSignal + tagSignal + reviewSignal + recencySignal;
 
-    const documentTitle = normalizeText(documentMap.get(documentId)?.title || documentId);
-    topDocumentsMap.set(documentTitle, (topDocumentsMap.get(documentTitle) || 0) + 1);
+    const documentTitle = normalizeInlineText(documentMap.get(documentId)?.title || documentId);
+    const documentStat = documentsStats.get(documentId) || {
+      documentId,
+      title: documentTitle,
+      highlights: 0,
+      notes: 0,
+      tagged: 0,
+      progress: { totalPages: 0, maxReadPage: 0, percent: 0 },
+    };
+    documentStat.highlights += 1;
+    if (note) {
+      documentStat.notes += 1;
+    }
+    if (tags.length > 0) {
+      documentStat.tagged += 1;
+    }
+    documentsStats.set(documentId, documentStat);
+
+    const tokens = tokenize(text).filter((token) => token.length >= 5).slice(0, 24);
+    for (const token of tokens) {
+      conceptFrequency.set(token, (conceptFrequency.get(token) || 0) + 1);
+    }
     for (const tag of tags) {
-      topTagsMap.set(tag, (topTagsMap.get(tag) || 0) + 1);
+      tagFrequency.set(tag, (tagFrequency.get(tag) || 0) + 1);
+      conceptFrequency.set(tag, (conceptFrequency.get(tag) || 0) + 2);
     }
 
     entries.push({
@@ -393,60 +481,55 @@ function collectHighlightContext(db, documentIds) {
       note,
       tags,
       baseQuality,
-      matchText: [text, note, tags.join(' ')].join('\n'),
       matchVector: buildTokenVector([text, note, tags.join(' ')].join(' ')),
       trigramSet: buildTrigramSet([text, note, tags.join(' ')].join(' ')),
     });
   }
 
-  const topTags = [...topTagsMap.entries()]
+  const topTags = [...tagFrequency.entries()]
     .sort((left, right) => right[1] - left[1])
-    .slice(0, 10)
+    .slice(0, 12)
     .map(([tag, count]) => ({ tag, count }));
 
-  const topDocuments = [...topDocumentsMap.entries()]
+  const topConcepts = [...conceptFrequency.entries()]
     .sort((left, right) => right[1] - left[1])
-    .slice(0, 8)
-    .map(([title, count]) => ({ title, count }));
+    .slice(0, 14)
+    .map(([concept, weight]) => ({ concept, weight: Number(weight.toFixed(2)) }));
+
+  const documentProfiles = [...documentsStats.values()]
+    .sort((left, right) => right.highlights - left.highlights)
+    .map((item) => ({
+      documentId: item.documentId,
+      title: item.title,
+      highlights: item.highlights,
+      notes: item.notes,
+      tagged: item.tagged,
+      progress: item.progress,
+    }));
 
   return {
     documents: filteredDocuments,
     entries,
+    topTags,
+    topConcepts,
+    documentProfiles,
     stats: {
-      highlights: entries.length,
       documents: filteredDocuments.length,
+      highlights: entries.length,
       withNotes,
       withTags,
       inboxCount,
     },
-    topTags,
-    topDocuments,
   };
 }
 
-function topConceptsFromContext(context, limit = 6) {
-  const scoreMap = new Map();
-
-  for (const entry of context.entries) {
-    for (const tag of entry.tags) {
-      scoreMap.set(tag, (scoreMap.get(tag) || 0) + 2);
-    }
-
-    const textTokens = tokenize(entry.text)
-      .filter((token) => token.length >= 5)
-      .slice(0, 18);
-    for (const token of textTokens) {
-      scoreMap.set(token, (scoreMap.get(token) || 0) + 0.25);
-    }
-  }
-
-  return [...scoreMap.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, Math.max(1, limit))
-    .map(([concept, weight]) => ({
-      concept,
-      weight: Number(weight.toFixed(2)),
-    }));
+function buildQuestionProfile(questionRaw) {
+  const question = cleanOcrText(questionRaw);
+  return {
+    question,
+    vector: buildTokenVector(question),
+    trigrams: buildTrigramSet(question),
+  };
 }
 
 function scoreHighlightForQuestion(entry, profile) {
@@ -454,15 +537,19 @@ function scoreHighlightForQuestion(entry, profile) {
     return entry.baseQuality;
   }
 
-  const cosine = cosineSimilarity(profile.tokenVector, entry.matchVector);
-  const trigram = jaccardSimilarity(profile.trigramSet, entry.trigramSet);
+  const cosine = cosineSimilarity(profile.vector, entry.matchVector);
+  const trigram = jaccardSimilarity(profile.trigrams, entry.trigramSet);
   const noteBoost = entry.note ? 0.06 : 0;
-  const tagBoost = Math.min(0.07, entry.tags.length * 0.015);
-  return entry.baseQuality * 0.45 + cosine * 0.4 + trigram * 0.15 + noteBoost + tagBoost;
+  const tagBoost = Math.min(0.08, entry.tags.length * 0.02);
+
+  return entry.baseQuality * 0.46 + cosine * 0.38 + trigram * 0.16 + noteBoost + tagBoost;
 }
 
-function pickEvidenceHighlights(context, question, limit = 12) {
+function pickEvidenceHighlights(context, question, depth, maxEvidence) {
   const profile = buildQuestionProfile(question);
+  const depthPreset = DEPTH_PRESETS[depth] || DEPTH_PRESETS.balanced;
+  const limit = clampInt(maxEvidence, depthPreset.evidenceLimit, 8, 64);
+
   const scored = context.entries
     .map((entry) => ({
       ...entry,
@@ -472,14 +559,15 @@ function pickEvidenceHighlights(context, question, limit = 12) {
 
   const selected = [];
   const perDocument = new Map();
+  const softCap = Math.max(2, Math.ceil(limit / Math.max(1, context.stats.documents || 1)));
+
   for (const item of scored) {
     if (selected.length >= limit) {
       break;
     }
 
     const count = perDocument.get(item.documentId) || 0;
-    const softCap = Math.max(2, Math.ceil(limit / Math.max(1, context.stats.documents)));
-    if (count >= softCap && selected.length < Math.max(2, limit - 2)) {
+    if (count >= softCap && selected.length < Math.max(3, limit - 3)) {
       continue;
     }
 
@@ -496,43 +584,10 @@ function pickEvidenceHighlights(context, question, limit = 12) {
     page: item.page,
     createdAt: item.createdAt || undefined,
     score: Number(item.relevanceScore.toFixed(4)),
-    text: truncateText(item.text, 520),
-    note: item.note ? truncateText(item.note, 220) : undefined,
+    text: truncateText(item.text, 680),
+    note: item.note ? truncateText(item.note, 260) : undefined,
     tags: item.tags,
   }));
-}
-
-function buildLocalPlan(input) {
-  const recommendations = [];
-
-  if (input.srs?.dueCount > 0) {
-    recommendations.push(`Пройти сегодня ${Math.min(25, input.srs.dueCount)} карточек (due: ${input.srs.dueCount}).`);
-  } else {
-    recommendations.push('SRS очередь пуста: добавьте новые карточки из последних хайлайтов.');
-  }
-
-  if (input.contextStats?.inboxCount > 0) {
-    recommendations.push(`Разобрать inbox-выделения без тегов/заметок: ${Math.min(12, input.contextStats.inboxCount)} шт.`);
-  }
-
-  if (input.summary?.usedHighlightsCount > 0) {
-    recommendations.push(`Сверить summary (${input.summary.usedHighlightsCount} хайлайтов) и сформулировать 2-3 action пункта.`);
-  }
-
-  if (input.topConcepts?.length > 0) {
-    recommendations.push(`Закрепить ключевые концепты: ${input.topConcepts.slice(0, 4).map((item) => item.concept).join(', ')}.`);
-  }
-
-  if (input.evidence?.length > 0) {
-    const top = input.evidence[0];
-    recommendations.push(`Начать повторение с [H${top.index}] ${truncateText(top.documentTitle, 38)} · стр. ${top.page}.`);
-  }
-
-  if (recommendations.length === 0) {
-    recommendations.push('Соберите больше данных чтения: создайте выделения и заметки для анализа.');
-  }
-
-  return recommendations.slice(0, clampInt(input.maxActions, 5, 3, 12));
 }
 
 function buildContextStats(context) {
@@ -545,29 +600,75 @@ function buildContextStats(context) {
   };
 }
 
+function buildLocalPlan(payload, maxActions) {
+  const recommendations = [];
+  const allowed = clampInt(maxActions, 8, 4, 14);
+
+  if (payload.srs?.dueCount > 0) {
+    recommendations.push(`Закрыть сегодня минимум ${Math.min(28, payload.srs.dueCount)} карточек SRS.`);
+  } else {
+    recommendations.push('SRS очередь пуста: добавьте новые карточки из свежих выделений.');
+  }
+
+  if (payload.contextStats.inboxHighlights > 0) {
+    recommendations.push(`Разобрать inbox (без тегов/заметок): ${Math.min(payload.contextStats.inboxHighlights, 14)} выделений.`);
+  }
+
+  if (payload.summary.usedHighlightsCount > 0) {
+    recommendations.push(`Проверить summary главы и зафиксировать 2-3 action пункта.`);
+  }
+
+  if (payload.topConcepts.length > 0) {
+    recommendations.push(`Повторить концепты: ${payload.topConcepts.slice(0, 4).map((item) => item.concept).join(', ')}.`);
+  }
+
+  if (payload.documentProfiles.length > 0) {
+    const weakest = payload.documentProfiles
+      .filter((item) => item.progress.totalPages > 0)
+      .sort((left, right) => left.progress.percent - right.progress.percent)[0];
+    if (weakest) {
+      recommendations.push(`Подтянуть отстающий документ: ${truncateText(weakest.title, 60)} (${weakest.progress.percent}%).`);
+    }
+  }
+
+  if (payload.evidence.length > 0) {
+    const lead = payload.evidence[0];
+    recommendations.push(`Начать с [H${lead.index}] ${truncateText(lead.documentTitle, 36)} · стр. ${lead.page}.`);
+  }
+
+  if (recommendations.length === 0) {
+    recommendations.push('Недостаточно данных: добавьте выделения, заметки и теги для анализа.');
+  }
+
+  return recommendations.slice(0, allowed);
+}
+
 function buildPrompt(payload) {
+  const depthPreset = DEPTH_PRESETS[payload.depth] || DEPTH_PRESETS.balanced;
+
   const lines = [];
-  lines.push('Ты AI-ассистент для глубокого чтения и повторения.');
-  lines.push('Отвечай только на русском языке.');
-  lines.push('Опирайся строго на переданный контекст. Если данных не хватает - прямо так и скажи.');
-  lines.push('Не придумывай цитаты, факты и страницы.');
+  lines.push('Ты AI-аналитик библиотеки чтения.');
+  lines.push('Ты работаешь только по переданному контексту и только на русском языке.');
+  lines.push('Запрещено выдумывать источники, страницы, книги, факты и цитаты.');
+  lines.push('Каждый вывод должен ссылаться на опорные фрагменты вида [H1], [H2], ...');
   lines.push('');
 
   lines.push(`Режим: ${payload.mode}.`);
-  lines.push(`SRS due: ${payload.srs?.dueCount || 0}; cards: ${payload.srs?.cards?.length || 0}.`);
-  lines.push(`Digest pages: ${payload.digest?.stats?.pages || 0}; highlights: ${payload.digest?.stats?.highlights || 0}.`);
-  lines.push(`Summary highlights: ${payload.summary?.usedHighlightsCount || 0}.`);
-  lines.push(
-    `Контекст библиотеки: документов ${payload.contextStats.documents}, хайлайтов ${payload.contextStats.highlights}, с заметками ${payload.contextStats.highlightsWithNotes}, с тегами ${payload.contextStats.highlightsWithTags}.`,
-  );
+  lines.push(`Глубина анализа: ${payload.depth}.`);
+  lines.push(`Вопрос пользователя: ${payload.question || 'не задан'}.`);
+  lines.push(`SRS due: ${payload.srs.dueCount}; total cards: ${payload.srs.cards.length}.`);
+  lines.push(`Digest: ${payload.digest.stats.pages} стр., ${payload.digest.stats.highlights} выделений.`);
+  lines.push(`Summary highlights: ${payload.summary.usedHighlightsCount}.`);
+  lines.push(`Контекст: документов ${payload.contextStats.documents}, выделений ${payload.contextStats.highlights}, заметок ${payload.contextStats.highlightsWithNotes}, тегированных ${payload.contextStats.highlightsWithTags}.`);
 
   if (payload.topConcepts.length > 0) {
-    lines.push(
-      `Ключевые концепты: ${payload.topConcepts
-        .slice(0, 8)
-        .map((item) => `${item.concept} (${item.weight})`)
-        .join(', ')}.`,
-    );
+    lines.push(`Ключевые концепты: ${payload.topConcepts.slice(0, 12).map((item) => `${item.concept}(${item.weight})`).join(', ')}.`);
+  }
+
+  lines.push('');
+  lines.push('Профили документов:');
+  for (const profile of payload.documentProfiles.slice(0, 16)) {
+    lines.push(`- ${profile.title}: highlights=${profile.highlights}, notes=${profile.notes}, tagged=${profile.tagged}, progress=${profile.progress.percent}% (${profile.progress.maxReadPage}/${profile.progress.totalPages || '—'}).`);
   }
 
   lines.push('');
@@ -575,209 +676,252 @@ function buildPrompt(payload) {
 
   let budget = 0;
   for (const item of payload.evidence) {
-    const header = `[H${item.index}] ${item.documentTitle} · стр. ${item.page} · score ${item.score}`;
-    const body = `Текст: ${truncateText(item.text, 430)}`;
-    const note = item.note ? `Заметка: ${truncateText(item.note, 180)}` : '';
-    const tags = item.tags?.length ? `Теги: ${item.tags.join(', ')}` : '';
-    const block = [header, body, note, tags].filter(Boolean).join('\n');
+    const row = [
+      `[H${item.index}] ${item.documentTitle} · стр. ${item.page} · score=${item.score}`,
+      `Текст: ${truncateText(item.text, 600)}`,
+      item.note ? `Заметка: ${truncateText(item.note, 230)}` : '',
+      item.tags?.length ? `Теги: ${item.tags.join(', ')}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
 
-    if (budget + block.length > 13000) {
+    if (budget + row.length > depthPreset.promptBudget) {
       break;
     }
-    budget += block.length;
-    lines.push(block);
+
+    budget += row.length;
+    lines.push(row);
     lines.push('');
   }
 
-  if (payload.question) {
-    lines.push(`Вопрос пользователя: ${payload.question}`);
-  } else {
-    lines.push('Пользователь не задал вопрос. Дай приоритетный план повторения.');
-  }
-
-  lines.push('');
-  lines.push('Формат ответа:');
-  lines.push('1) Краткий диагноз (3-5 пунктов).');
-  lines.push('2) Приоритетный план на сегодня (5-8 пунктов).');
-  lines.push('3) Ответ на вопрос пользователя с ссылками на [Hn].');
-  lines.push('4) Что повторить первым (до 5 пунктов).');
+  lines.push('Формат ответа (строго markdown):');
+  lines.push('## Executive Summary');
+  lines.push('Коротко 5-7 пунктов с [Hn].');
+  lines.push('## Cross-Book Patterns');
+  lines.push('Общие закономерности между книгами/главами (до 7 пунктов).');
+  lines.push('## Blind Spots and Risks');
+  lines.push('Пробелы, противоречия, риск ложного понимания (до 6 пунктов).');
+  lines.push('## 7-Day Action Plan');
+  lines.push('План на 7 дней в формате D1..D7.');
+  lines.push('## Review First');
+  lines.push('Что повторить первым прямо сейчас (до 8 пунктов).');
+  lines.push('## Direct Answer');
+  lines.push('Прямой ответ на вопрос пользователя (если вопрос задан).');
+  lines.push('## Citations Used');
+  lines.push('Список [Hn] с кратким комментарием по использованию.');
 
   return lines.join('\n');
 }
 
-function extractOpenAiText(json) {
-  const direct = normalizeText(json?.output_text || '');
+function resolveApiRuntime() {
+  const apiUrl = normalizeInlineText(process.env.RECALL_AI_API_URL || DEFAULT_API_URL);
+  const apiKey = normalizeInlineText(
+    process.env.RECALL_AI_API_KEY ||
+      process.env.OPENROUTER_API_KEY ||
+      process.env.OPENAI_API_KEY ||
+      EMBEDDED_AI_API_KEY,
+  );
+  const model = normalizeInlineText(process.env.RECALL_AI_MODEL || FREE_DEFAULT_API_MODEL);
+  const authMode = normalizeInlineText(process.env.RECALL_AI_AUTH_MODE || 'auto').toLowerCase();
+  return { apiUrl, apiKey, model, authMode };
+}
+
+function extractApiText(json) {
+  const direct = normalizeInlineText(json?.output_text || '');
   if (direct) {
     return direct;
   }
 
-  const chunks = [];
-  const output = Array.isArray(json?.output) ? json.output : [];
-  for (const item of output) {
-    const content = Array.isArray(item?.content) ? item.content : [];
-    for (const part of content) {
-      const text = normalizeText(part?.text || '');
-      if (text) {
-        chunks.push(text);
-      }
-    }
+  const choiceText = normalizeInlineText(json?.choices?.[0]?.message?.content || '');
+  if (choiceText) {
+    return choiceText;
   }
 
-  return normalizeText(chunks.join('\n'));
+  const messageContent = json?.choices?.[0]?.message?.content;
+  if (Array.isArray(messageContent)) {
+    const parts = messageContent
+      .map((item) => normalizeInlineText(item?.text || item?.content || ''))
+      .filter(Boolean);
+    return normalizeInlineText(parts.join('\n'));
+  }
+
+  return '';
 }
 
-async function generateWithOpenAi(payload) {
-  const apiKey = normalizeText(process.env.RECALL_OPENAI_API_KEY || process.env.OPENAI_API_KEY);
-  if (!apiKey) {
-    return null;
+async function generateWithApi(payload, options = {}) {
+  const runtimeBase = resolveApiRuntime();
+  const runtime = {
+    ...runtimeBase,
+    model: normalizeInlineText(options.model || runtimeBase.model),
+  };
+
+  if (!runtime.apiUrl) {
+    throw new Error('Не задан AI API URL.');
+  }
+  if (!runtime.apiKey) {
+    throw new Error('Не задан AI API ключ (RECALL_AI_API_KEY).');
+  }
+  if (!runtime.model) {
+    throw new Error('Не задана AI модель (RECALL_AI_MODEL).');
   }
 
-  const model = normalizeText(process.env.RECALL_OPENAI_MODEL || 'gpt-4o-mini');
+  const depthPreset = DEPTH_PRESETS[payload.depth] || DEPTH_PRESETS.balanced;
   const prompt = buildPrompt(payload);
+  const urlLower = runtime.apiUrl.toLowerCase();
+  const isOpenRouter = urlLower.includes('openrouter.ai');
+  const hasOpenRouterKeyFormat = /^sk-or-v1-[a-z0-9]+$/i.test(runtime.apiKey);
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+  const authMode = runtime.authMode;
+  if (authMode === 'bearer' || authMode === 'auto') {
+    headers.Authorization = `Bearer ${runtime.apiKey}`;
+  } else if (authMode === 'token') {
+    headers.Authorization = runtime.apiKey;
+  }
+  if (authMode === 'apikey' || authMode === 'auto') {
+    headers['X-API-Key'] = runtime.apiKey;
+    headers['api-key'] = runtime.apiKey;
+  }
+  if (isOpenRouter) {
+    headers['HTTP-Referer'] = 'https://recall.local';
+    headers['X-Title'] = 'Recall PDF';
+  }
 
-  const response = await fetch('https://api.openai.com/v1/responses', {
+  const response = await fetch(runtime.apiUrl, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
-      model,
-      input: prompt,
+      model: runtime.model,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Ты AI-аналитик чтения. Отвечай на русском. Используй только переданный контекст и ссылки [Hn].',
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
       temperature: 0.15,
-      max_output_tokens: 950,
+      max_tokens: depthPreset.maxOutputTokens,
     }),
   });
 
   if (!response.ok) {
     const body = await response.text().catch(() => '');
-    throw new Error(`OpenAI HTTP ${response.status}: ${body.slice(0, 280)}`);
+    const bodyLower = String(body || '').toLowerCase();
+    if (response.status >= 500 && bodyLower.includes('servers restarting')) {
+      throw new Error('AI API временно недоступен: серверы ArliAI перезапускаются. Повторите через 5 минут.');
+    }
+    if (response.status === 401 && isOpenRouter) {
+      throw new Error(
+        hasOpenRouterKeyFormat
+          ? 'AI API HTTP 401: OpenRouter отклонил ключ. Проверьте права/лимиты ключа.'
+          : 'AI API HTTP 401: для OpenRouter нужен ключ формата sk-or-v1-... (текущий ключ UUID-формата). Укажите корректный endpoint в RECALL_AI_API_URL для вашего UUID-ключа.',
+      );
+    }
+    throw new Error(`AI API HTTP ${response.status}: ${body.slice(0, 280)}`);
   }
 
   const json = await response.json();
-  const text = extractOpenAiText(json);
+  const text = extractApiText(json);
   if (!text) {
-    throw new Error('OpenAI returned empty response');
+    throw new Error('AI API вернул пустой ответ.');
   }
+
+  const usage = json?.usage || {};
 
   return {
-    provider: `openai:${model}`,
+    provider: `api:${runtime.model}`,
     text,
+    model: runtime.model,
+    endpoint: runtime.apiUrl,
+    promptChars: prompt.length,
+    evalCount: Number(usage?.completion_tokens || 0),
+    promptEvalCount: Number(usage?.prompt_tokens || 0),
   };
-}
-
-async function generateWithOllama(payload) {
-  const baseUrl = normalizeText(process.env.RECALL_OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/+$/, '');
-  const model = normalizeText(process.env.RECALL_OLLAMA_MODEL || 'qwen2.5:7b');
-  if (!baseUrl || !model) {
-    return null;
-  }
-
-  const prompt = buildPrompt(payload);
-  const response = await fetch(`${baseUrl}/api/generate`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      prompt,
-      stream: false,
-      options: {
-        temperature: 0.15,
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`Ollama HTTP ${response.status}: ${body.slice(0, 280)}`);
-  }
-
-  const json = await response.json();
-  const text = normalizeText(json?.response || json?.message?.content || '');
-  if (!text) {
-    throw new Error('Ollama returned empty response');
-  }
-
-  return {
-    provider: `ollama:${model}`,
-    text,
-  };
-}
-
-function buildLocalQuestionAnswer(question, evidence) {
-  if (!question) {
-    return 'Вопрос не задан. Сформирован приоритетный план по текущему контексту чтения.';
-  }
-
-  if (!Array.isArray(evidence) || evidence.length === 0) {
-    return 'Для ответа недостаточно релевантных фрагментов. Добавьте больше выделений или снимите фильтр.';
-  }
-
-  const lead = evidence[0];
-  const supporting = evidence.slice(1, 3);
-  const lines = [
-    `Основной опорный тезис: [H${lead.index}] ${truncateText(lead.text, 200)}`,
-  ];
-
-  if (supporting.length > 0) {
-    lines.push(
-      `Поддерживающие фрагменты: ${supporting
-        .map((item) => `[H${item.index}] ${truncateText(item.text, 120)}`)
-        .join('; ')}`,
-    );
-  }
-
-  lines.push('Проверьте цитаты в оригинале и уточните вопрос для более точного плана действий.');
-  return lines.join('\n');
 }
 
 function formatLocalAnswer(payload, recommendations) {
   const lines = [];
-  lines.push(`# AI Assistant · ${payload.mode}`);
-  lines.push('');
-  lines.push('## Диагноз');
-  lines.push(`- SRS due: ${payload.srs?.dueCount || 0}, всего карточек: ${payload.srs?.cards?.length || 0}`);
-  lines.push(
-    `- Чтение за период: ${payload.digest?.stats?.pages || 0} стр. / ${Math.round((payload.digest?.stats?.seconds || 0) / 60)} мин.`,
-  );
-  lines.push(`- Хайлайтов в контексте: ${payload.contextStats.highlights} (заметки: ${payload.contextStats.highlightsWithNotes}, теги: ${payload.contextStats.highlightsWithTags})`);
-  lines.push(`- Inbox без обработки: ${payload.contextStats.inboxHighlights}`);
 
-  if (payload.topConcepts?.length > 0) {
-    lines.push(`- Ключевые концепты: ${payload.topConcepts.slice(0, 6).map((item) => item.concept).join(', ')}`);
+  lines.push('# Executive Summary');
+  lines.push(`- Контекст: ${payload.contextStats.documents} док., ${payload.contextStats.highlights} выделений.`);
+  lines.push(`- SRS due: ${payload.srs.dueCount}, digest: ${payload.digest.stats.pages} стр./${payload.digest.stats.highlights} выдел.`);
+  if (payload.topConcepts.length > 0) {
+    lines.push(`- Ключевые концепты: ${payload.topConcepts.slice(0, 6).map((item) => item.concept).join(', ')}.`);
+  }
+  lines.push(`- Inbox без обработки: ${payload.contextStats.inboxHighlights}.`);
+
+  lines.push('');
+  lines.push('# Cross-Book Patterns');
+  if (payload.documentProfiles.length > 0) {
+    for (const profile of payload.documentProfiles.slice(0, 4)) {
+      lines.push(`- ${profile.title}: ${profile.highlights} выделений, прогресс ${profile.progress.percent}%.`);
+    }
+  } else {
+    lines.push('- Недостаточно данных для кросс-книжного анализа.');
   }
 
   lines.push('');
-  lines.push('## План');
-  for (const step of recommendations) {
-    lines.push(`- ${step}`);
+  lines.push('# Blind Spots and Risks');
+  if (payload.contextStats.inboxHighlights > 0) {
+    lines.push(`- Много необработанных выделений без тегов/заметок: ${payload.contextStats.inboxHighlights}.`);
+  }
+  lines.push('- Уточните вопрос для более узкого анализа: текущий ответ построен из общей выборки.');
+
+  lines.push('');
+  lines.push('# 7-Day Action Plan');
+  for (let index = 0; index < Math.min(7, recommendations.length); index += 1) {
+    lines.push(`- D${index + 1}: ${recommendations[index]}`);
   }
 
   lines.push('');
-  lines.push('## Ответ на вопрос');
-  lines.push(buildLocalQuestionAnswer(payload.question, payload.evidence));
-
-  if (payload.evidence?.length > 0) {
-    lines.push('');
-    lines.push('## Опорные фрагменты');
+  lines.push('# Review First');
+  if (payload.evidence.length > 0) {
     for (const item of payload.evidence.slice(0, 6)) {
       lines.push(`- [H${item.index}] ${item.documentTitle} · стр. ${item.page}: ${truncateText(item.text, 170)}`);
     }
+  } else {
+    lines.push('- Нет релевантных фрагментов для приоритизации.');
+  }
+
+  lines.push('');
+  lines.push('# Direct Answer');
+  if (payload.question) {
+    lines.push(`- Вопрос: ${payload.question}`);
+    if (payload.evidence.length > 0) {
+      lines.push(`- Основной опорный фрагмент: [H${payload.evidence[0].index}] ${truncateText(payload.evidence[0].text, 220)}`);
+    } else {
+      lines.push('- Для ответа недостаточно релевантных цитат в текущем фильтре.');
+    }
+  } else {
+    lines.push('- Пользовательский вопрос не задан; сформирован общий план повторения.');
+  }
+
+  lines.push('');
+  lines.push('# Citations Used');
+  if (payload.evidence.length > 0) {
+    for (const item of payload.evidence.slice(0, 8)) {
+      lines.push(`- [H${item.index}] ${item.documentTitle} · стр. ${item.page} (score ${item.score})`);
+    }
+  } else {
+    lines.push('- Нет доступных цитат.');
   }
 
   return lines.join('\n');
 }
 
-function buildResultBase(nowIso, payload, text, provider, recommendations) {
+function buildResultBase(nowIso, payload, input) {
   return {
     generatedAt: nowIso,
     mode: payload.mode,
-    provider,
+    provider: input.provider,
     question: payload.question || undefined,
-    text,
-    recommendations,
+    text: input.text,
+    recommendations: payload.recommendations,
     metrics: {
       dueCount: payload.srs.dueCount,
       digestPages: payload.digest.stats.pages,
@@ -788,21 +932,41 @@ function buildResultBase(nowIso, payload, text, provider, recommendations) {
     ragAnswer: null,
     contextStats: payload.contextStats,
     evidence: payload.evidence,
+    engine: {
+      runtime: input.runtime,
+      model: input.model,
+      endpoint: input.endpoint,
+      depth: payload.depth,
+      warnings: input.warnings || [],
+      promptChars: input.promptChars,
+      evidenceUsed: payload.evidence.length,
+      evalCount: input.evalCount,
+      promptEvalCount: input.promptEvalCount,
+      latencyMs: input.latencyMs,
+      installHint: input.installHint,
+    },
   };
 }
 
 async function generateAiAssistantBrief(db, options = {}) {
   const nowIso = new Date().toISOString();
+  const startedAt = Date.now();
+
   const mode = getReadingMode(options.mode);
+  const provider = resolveProvider(options.provider);
+  const depth = getAnalysisDepth(options.analysisDepth);
   const documentIds = resolveDocumentIds(options);
-  const maxActions = clampInt(options.maxActions, 5, 3, 12);
-  const question = cleanOcrText(options.question || '');
-  const provider = normalizeText(options.provider || 'auto').toLowerCase();
+  const question = cleanOcrText(options.question || options.task || '');
+
+  const depthPreset = DEPTH_PRESETS[depth] || DEPTH_PRESETS.balanced;
+  const maxActions = clampInt(options.maxActions, depthPreset.maxActions, 3, 20);
+  const maxEvidence = clampInt(options.maxEvidence, depthPreset.evidenceLimit, 8, 64);
+  const selectedModel = resolveApiRuntime().model;
 
   const srs = generateSrsDeck(db, {
     documentIds,
     dueOnly: true,
-    limit: 180,
+    limit: 280,
   });
   const digest = buildReadingDigest(db, {
     period: mode === 'review' ? 'weekly' : 'daily',
@@ -810,105 +974,106 @@ async function generateAiAssistantBrief(db, options = {}) {
   });
   const summary = summarizeHighlights(db, {
     documentId: documentIds?.length === 1 ? documentIds[0] : undefined,
-    maxSentences: mode === 'focus' ? 5 : 8,
+    maxSentences: mode === 'focus' ? 6 : 10,
   });
 
   const context = collectHighlightContext(db, documentIds);
-  const topConcepts = topConceptsFromContext(context, 8);
-  const evidence = pickEvidenceHighlights(context, question, mode === 'review' ? 14 : 12);
+  const topConcepts = context.topConcepts.slice(0, 10);
+  const documentProfiles = context.documentProfiles;
+  const evidence = pickEvidenceHighlights(context, question, depth, maxEvidence);
   const contextStats = buildContextStats(context);
 
-  const recommendations = buildLocalPlan({
-    srs,
-    digest,
-    summary,
-    topConcepts,
-    evidence,
-    contextStats,
-    maxActions,
-  });
-
-  const promptPayload = {
+  const payload = {
     mode,
+    depth,
     question,
     srs,
     digest,
     summary,
     topConcepts,
-    evidence,
+    documentProfiles,
     contextStats,
+    evidence,
+    recommendations: [],
   };
 
-  const localAnswer = formatLocalAnswer(
-    {
-      ...promptPayload,
-    },
-    recommendations,
-  );
+  payload.recommendations = buildLocalPlan(payload, maxActions);
 
-  if (provider === 'openai') {
+  const localText = formatLocalAnswer(payload, payload.recommendations);
+
+  if (provider === 'local') {
+    return buildResultBase(nowIso, payload, {
+      provider: 'local',
+      runtime: 'local',
+      model: 'heuristic-local',
+      endpoint: '',
+      text: localText,
+      warnings: ['Запущен локальный fallback без LLM.'],
+      promptChars: 0,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+    });
+  }
+
+  const tryApi = async () => {
+    const remote = await generateWithApi(payload, { model: selectedModel });
+    return buildResultBase(nowIso, payload, {
+      provider: remote.provider,
+      runtime: 'api',
+      model: remote.model,
+      endpoint: remote.endpoint,
+      text: remote.text,
+      warnings: [],
+      promptChars: remote.promptChars,
+      evalCount: remote.evalCount,
+      promptEvalCount: remote.promptEvalCount,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      installHint: 'AI runtime управляется приложением и скрыт от пользователя.',
+    });
+  };
+
+  if (provider === 'api') {
     try {
-      const ai = await generateWithOpenAi(promptPayload);
-      if (!ai) {
-        throw new Error('OpenAI key not configured');
-      }
-      return buildResultBase(nowIso, promptPayload, ai.text, ai.provider, recommendations);
+      return await tryApi();
     } catch (error) {
-      return buildResultBase(
-        nowIso,
-        promptPayload,
-        `${localAnswer}\n\n[OpenAI fallback reason] ${String(error?.message || error)}`,
-        'local:fallback-openai',
-        recommendations,
-      );
+      const reason = String(error?.message || error);
+      return buildResultBase(nowIso, payload, {
+        provider: 'local:fallback-api',
+        runtime: 'local',
+        model: 'heuristic-local',
+        endpoint: resolveApiRuntime().apiUrl,
+        text: `${localText}\n\n[LLM fallback reason] ${reason}`,
+        warnings: [reason],
+        promptChars: 0,
+        latencyMs: Math.max(0, Date.now() - startedAt),
+        installHint: 'Обратитесь к администратору: AI runtime управляется приложением.',
+      });
     }
   }
 
-  if (provider === 'ollama') {
-    try {
-      const ai = await generateWithOllama(promptPayload);
-      if (!ai) {
-        throw new Error('Ollama settings not configured');
-      }
-      return buildResultBase(nowIso, promptPayload, ai.text, ai.provider, recommendations);
-    } catch (error) {
-      return buildResultBase(
-        nowIso,
-        promptPayload,
-        `${localAnswer}\n\n[Ollama fallback reason] ${String(error?.message || error)}`,
-        'local:fallback-ollama',
-        recommendations,
-      );
-    }
+  try {
+    return await tryApi();
+  } catch (error) {
+    const reason = String(error?.message || error);
+    return buildResultBase(nowIso, payload, {
+      provider: 'local:auto-fallback',
+      runtime: 'local',
+      model: 'heuristic-local',
+      endpoint: resolveApiRuntime().apiUrl,
+      text: `${localText}\n\n[LLM fallback reason] ${reason}`,
+      warnings: [reason],
+      promptChars: 0,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      installHint: 'Обратитесь к администратору: AI runtime управляется приложением.',
+    });
   }
-
-  if (provider === 'auto') {
-    const fallbackErrors = [];
-    try {
-      const ai = await generateWithOpenAi(promptPayload);
-      if (ai) {
-        return buildResultBase(nowIso, promptPayload, ai.text, ai.provider, recommendations);
-      }
-    } catch (error) {
-      fallbackErrors.push(`openai: ${String(error?.message || error)}`);
-    }
-
-    try {
-      const ai = await generateWithOllama(promptPayload);
-      if (ai) {
-        return buildResultBase(nowIso, promptPayload, ai.text, ai.provider, recommendations);
-      }
-    } catch (error) {
-      fallbackErrors.push(`ollama: ${String(error?.message || error)}`);
-    }
-
-    const details = fallbackErrors.length > 0 ? `\n\n[AI fallback reasons] ${fallbackErrors.join(' | ')}` : '';
-    return buildResultBase(nowIso, promptPayload, `${localAnswer}${details}`, 'local:auto', recommendations);
-  }
-
-  return buildResultBase(nowIso, promptPayload, localAnswer, 'local', recommendations);
 }
 
 module.exports = {
   generateAiAssistantBrief,
+  __private: {
+    FREE_DEFAULT_API_MODEL,
+    FREE_MODEL_ALIASES,
+    DEPTH_PRESETS,
+    getAnalysisDepth,
+  },
 };

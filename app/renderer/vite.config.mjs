@@ -1,10 +1,13 @@
-import { defineConfig } from 'vite';
+import { defineConfig, normalizePath } from 'vite';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 import react from '@vitejs/plugin-react-swc';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const webviewerPublicDir = normalizePath(
+  resolve(__dirname, '../../node_modules/@pdftron/webviewer/public'),
+);
 
 export default defineConfig({
   root: __dirname,
@@ -14,7 +17,7 @@ export default defineConfig({
     viteStaticCopy({
       targets: [
         {
-          src: resolve(__dirname, '../../node_modules/@pdftron/webviewer/public/**/*'),
+          src: `${webviewerPublicDir}/**/*`,
           dest: 'webviewer',
         },
       ],

@@ -31,12 +31,22 @@ interface InsightsViewProps {
   ) => Promise<HighlightRecord>;
 }
 
-const AI_QUICK_PROMPTS = [
-  'Что повторить в первую очередь?',
-  'Где у меня слабые места в понимании?',
-  'Собери план на 30 минут повторения.',
-  'Какие идеи из книги наиболее прикладные?',
+const AI_QUICK_TASKS = [
+  'Сделай полный аудит понимания по всем книгам и найди слепые зоны.',
+  'Построй 7-дневный план повторения с приоритетом по рискам забывания.',
+  'Собери cross-book инсайты: где идеи конфликтуют и где усиливают друг друга.',
+  'Сгенерируй список ключевых тезисов, которые надо объяснить своими словами.',
 ] as const;
+
+function getLockedModeByPreset(preset: WorkspacePreset): 'focus' | 'research' | 'review' {
+  if (preset === 'focus') {
+    return 'focus';
+  }
+  if (preset === 'review') {
+    return 'review';
+  }
+  return 'research';
+}
 
 function normalizeDocFilter(value: string, documents: DocumentRecord[]) {
   if (value === 'all') {
@@ -75,6 +85,16 @@ function getCurrentCard(srsDeck: SrsDeckResult | null, index: number): SrsCard |
   return srsDeck.cards[Math.max(0, Math.min(index, srsDeck.cards.length - 1))] || null;
 }
 
+function defaultTaskByMode(mode: 'focus' | 'research' | 'review') {
+  if (mode === 'focus') {
+    return 'Выдели самое важное для короткой сессии: что читать/повторять в первую очередь и почему.';
+  }
+  if (mode === 'review') {
+    return 'Сделай план повторения по рискам забывания и сформируй приоритеты на сегодня.';
+  }
+  return 'Сделай глубокий анализ по всем книгам: паттерны, риски и actionable план.';
+}
+
 export function InsightsView({
   workspacePreset,
   documents,
@@ -101,9 +121,7 @@ export function InsightsView({
   const [summaryResult, setSummaryResult] = useState<HighlightSummaryResult | null>(null);
 
   const [aiLoading, setAiLoading] = useState(false);
-  const [aiMode, setAiMode] = useState<'focus' | 'research' | 'review'>('research');
-  const [aiProvider, setAiProvider] = useState<'auto' | 'local' | 'ollama' | 'openai'>('auto');
-  const [aiQuestion, setAiQuestion] = useState('');
+  const [aiTask, setAiTask] = useState<string>(defaultTaskByMode('research'));
   const [aiResult, setAiResult] = useState<AiAssistantResult | null>(null);
 
   const [activeDigestPeriod, setActiveDigestPeriod] = useState<'daily' | 'weekly'>('daily');
@@ -120,14 +138,14 @@ export function InsightsView({
   useEffect(() => {
     if (workspacePreset === 'focus') {
       setActiveDigestPeriod('daily');
-      setAiMode('focus');
+      setAiTask(defaultTaskByMode('focus'));
     }
     if (workspacePreset === 'review') {
       setShowAnswer(true);
-      setAiMode('review');
+      setAiTask(defaultTaskByMode('review'));
     }
     if (workspacePreset === 'research') {
-      setAiMode('research');
+      setAiTask(defaultTaskByMode('research'));
     }
   }, [workspacePreset]);
 
@@ -244,15 +262,20 @@ export function InsightsView({
   async function handleRunAiAssistant() {
     setAiLoading(true);
     try {
+      const lockedMode = getLockedModeByPreset(workspacePreset);
       const result = await generateAiAssistantBrief({
         documentId: documentFilter === 'all' ? undefined : documentFilter,
-        mode: aiMode,
-        provider: aiProvider,
-        question: aiQuestion.trim() || undefined,
-        maxActions: 8,
+        mode: lockedMode,
+        task: aiTask.trim() || undefined,
+        question: aiTask.trim() || undefined,
+        maxEvidence: lockedMode === 'focus' ? 14 : lockedMode === 'review' ? 24 : 40,
+        maxActions: lockedMode === 'focus' ? 6 : lockedMode === 'review' ? 8 : 10,
       });
       setAiResult(result);
-      onNotify(`AI анализ готов (${result.provider}).`, 'success');
+      onNotify('AI анализ готов.', 'success');
+      if (result.engine?.warnings?.length) {
+        onNotify(`AI предупреждение: ${result.engine.warnings[0]}`, 'info');
+      }
     } catch (error: any) {
       onNotify(`AI ошибка: ${String(error?.message || error)}`, 'error');
     } finally {
@@ -280,8 +303,8 @@ export function InsightsView({
     <section className="view-shell">
       <LiquidSurface className="glass-panel view-header insights-header">
         <div className="insights-header-main">
-          <h1>Insights</h1>
-          <p className="muted">Единый центр повторения: AI-анализ по книгам и хайлайтам, SRS, digest и chapter summary.</p>
+          <h1>Insights AI Workspace</h1>
+          <p className="muted">API-first AI блок: анализ книг и хайлайтов без локальных установок моделей.</p>
           <div className="insights-stats-row">
             <span className="chip">Документов: {documents.length}</span>
             <span className="chip">Фильтр: {selectedDocument ? truncate(selectedDocument.title, 46) : 'Вся библиотека'}</span>
@@ -315,72 +338,48 @@ export function InsightsView({
       <section className="insights-grid">
         <LiquidSurface className="glass-panel insights-card insights-card-wide insights-card-ai">
           <div className="table-head">
-            <h2>AI Ассистент библиотеки</h2>
-            <span className="muted">{aiResult ? aiResult.provider : 'assistant'}</span>
+            <h2>AI Studio</h2>
           </div>
-          <p className="muted">Ассистент строит ответ по книгам, хайлайтам, заметкам и текущему прогрессу чтения с цитатами-источниками.</p>
-          <div className="insights-ai-controls">
-            <label>
-              Режим
-              <select
-                value={aiMode}
-                onChange={(event) => setAiMode(event.target.value as 'focus' | 'research' | 'review')}
-              >
-                <option value="focus">Focus</option>
-                <option value="research">Research</option>
-                <option value="review">Review</option>
-              </select>
-            </label>
-            <label>
-              Провайдер
-              <select
-                value={aiProvider}
-                onChange={(event) => setAiProvider(event.target.value as 'auto' | 'local' | 'ollama' | 'openai')}
-              >
-                <option value="auto">auto</option>
-                <option value="local">local</option>
-                <option value="ollama">ollama</option>
-                <option value="openai">openai</option>
-              </select>
-            </label>
+          <p className="muted">Режим AI зафиксирован приложением. Настройки модели/API скрыты и недоступны пользователю.</p>
+          <div className="insights-stats-row">
+            <span className="chip">Профиль: Managed API</span>
+            <span className="chip">Режим: {getLockedModeByPreset(workspacePreset)}</span>
           </div>
+
           <label>
-            Вопрос (опционально)
-            <input
-              type="text"
-              value={aiQuestion}
-              placeholder="Например: что повторять в первую очередь и почему?"
-              onChange={(event) => setAiQuestion(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  void handleRunAiAssistant();
-                }
-              }}
+            Задача для AI
+            <textarea
+              className="insights-ai-task"
+              value={aiTask}
+              placeholder="Опишите задачу максимально конкретно"
+              onChange={(event) => setAiTask(event.target.value)}
             />
           </label>
+
           <div className="insights-prompt-hints">
-            {AI_QUICK_PROMPTS.map((prompt) => (
+            {AI_QUICK_TASKS.map((prompt) => (
               <button
                 key={prompt}
                 type="button"
                 className="btn ghost"
                 onClick={() => {
-                  setAiQuestion(prompt);
+                  setAiTask(prompt);
                 }}
               >
-                {prompt}
+                {truncate(prompt, 62)}
               </button>
             ))}
           </div>
+
           <div className="action-row compact">
             <button type="button" className="btn primary" onClick={() => void handleRunAiAssistant()} disabled={aiLoading}>
-              {aiLoading ? 'Анализ…' : 'Запустить AI-анализ'}
+              {aiLoading ? 'Анализ…' : 'Запустить полный AI-анализ'}
             </button>
             <button type="button" className="btn ghost" onClick={() => void handleCopyAiAnswer()}>
               Копировать ответ
             </button>
           </div>
+
           {aiResult ? (
             <div className="insights-block-scroll insights-ai-result">
               <div className="insights-stats-row">
@@ -388,15 +387,20 @@ export function InsightsView({
                 <span className="chip">pages: {aiResult.metrics.digestPages}</span>
                 <span className="chip">highlights: {aiResult.metrics.digestHighlights}</span>
                 <span className="chip">summary: {aiResult.metrics.summaryHighlights}</span>
-                {aiResult.contextStats ? (
-                  <>
-                    <span className="chip">контекст: {aiResult.contextStats.highlights}</span>
-                    <span className="chip">с заметками: {aiResult.contextStats.highlightsWithNotes}</span>
-                    <span className="chip">inbox: {aiResult.contextStats.inboxHighlights}</span>
-                  </>
-                ) : null}
+                {aiResult.engine?.latencyMs !== undefined ? <span className="chip">latency: {Math.round(aiResult.engine.latencyMs)}ms</span> : null}
               </div>
+
+              {aiResult.engine?.warnings?.length ? (
+                <div className="insights-ai-warning">
+                  <strong>Предупреждение:</strong> {aiResult.engine.warnings[0]}
+                  {aiResult.engine.installHint ? (
+                    <code>{aiResult.engine.installHint}</code>
+                  ) : null}
+                </div>
+              ) : null}
+
               <pre className="insights-pre">{aiResult.text}</pre>
+
               {aiResult.recommendations.length > 0 ? (
                 <>
                   <p className="muted">Рекомендации:</p>
@@ -407,17 +411,18 @@ export function InsightsView({
                   </ul>
                 </>
               ) : null}
+
               {aiResult.evidence?.length ? (
                 <>
                   <p className="muted">Опорные фрагменты:</p>
                   <div className="insights-citations">
-                    {aiResult.evidence.slice(0, 8).map((citation) => (
+                    {aiResult.evidence.slice(0, 10).map((citation) => (
                       <article key={`${citation.highlightId}-${citation.index}`} className="insights-citation-card">
                         <p>
                           <strong>[{citation.index}] {truncate(citation.documentTitle, 64)}</strong> · стр. {citation.page}
                         </p>
-                        <p>{truncateSelectionText(citation.text, 220)}</p>
-                        {citation.note ? <p className="muted">Заметка: {truncateSelectionText(citation.note, 140)}</p> : null}
+                        <p>{truncateSelectionText(citation.text, 240)}</p>
+                        {citation.note ? <p className="muted">Заметка: {truncateSelectionText(citation.note, 160)}</p> : null}
                         <div className="action-row compact">
                           <button
                             type="button"
@@ -434,7 +439,7 @@ export function InsightsView({
               ) : null}
             </div>
           ) : (
-            <p className="muted">Запустите AI-анализ для плана повторения и рекомендаций по вашим книгам.</p>
+            <p className="muted">Запустите AI-анализ для полной диагностики библиотеки и плана повторения.</p>
           )}
         </LiquidSurface>
 

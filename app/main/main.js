@@ -1172,7 +1172,16 @@ function registerIpc() {
   registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_AI_ASSISTANT, async (_event, payload) => {
     const validated = validateChannelPayload(IPC_CHANNELS.INSIGHTS_AI_ASSISTANT, payload || {});
     const db = await loadDB(storagePaths);
-    return generateAiAssistantBrief(db, validated);
+    return generateAiAssistantBrief(db, {
+      documentId: validated.documentId,
+      documentIds: validated.documentIds,
+      question: validated.question,
+      task: validated.task,
+      mode: validated.mode,
+      maxEvidence: validated.maxEvidence,
+      maxActions: validated.maxActions,
+      provider: 'api',
+    });
   });
 
   registerTrustedIpcHandle(IPC_CHANNELS.APP_GET_STORAGE_PATHS, () => {

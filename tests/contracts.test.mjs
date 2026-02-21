@@ -139,15 +139,23 @@ describe('shared contracts', () => {
     const aiPayload = validateChannelPayload(IPC_CHANNELS.INSIGHTS_AI_ASSISTANT, {
       documentId: 'doc-1',
       mode: 'review',
-      provider: 'ollama',
+      provider: 'api',
       question: 'Что повторять?',
+      model: 'meta-llama/llama-3.1-8b-instruct:free',
+      apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
+      analysisDepth: 'deep',
+      maxEvidence: 32,
       maxActions: 7,
     });
     expect(aiPayload).toEqual({
       documentId: 'doc-1',
       mode: 'review',
-      provider: 'ollama',
+      provider: 'api',
       question: 'Что повторять?',
+      model: 'meta-llama/llama-3.1-8b-instruct:free',
+      apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
+      analysisDepth: 'deep',
+      maxEvidence: 32,
       maxActions: 7,
     });
   });

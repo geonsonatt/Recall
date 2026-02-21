@@ -39,14 +39,18 @@ describe('ai assistant', () => {
     const result = await generateAiAssistantBrief(makeDb(), {
       provider: 'local',
       mode: 'review',
+      analysisDepth: 'deep',
+      model: 'qwen2.5:7b',
       question: 'Что повторять сначала?',
       documentId: 'doc-1',
     });
 
     expect(result.provider).toBe('local');
     expect(result.mode).toBe('review');
-    expect(result.text).toContain('AI Assistant');
+    expect(result.text).toContain('Executive Summary');
     expect(result.recommendations.length).toBeGreaterThan(0);
     expect(result.metrics.dueCount).toBeGreaterThanOrEqual(0);
+    expect(result.engine?.runtime).toBe('local');
+    expect(result.engine?.depth).toBe('deep');
   });
 });

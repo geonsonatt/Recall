@@ -123,8 +123,14 @@ declare global {
         documentId?: string;
         documentIds?: string[];
         question?: string;
+        task?: string;
         mode?: 'focus' | 'research' | 'review';
-        provider?: 'auto' | 'local' | 'ollama' | 'openai';
+        provider?: 'auto' | 'local' | 'api';
+        model?: string;
+        apiUrl?: string;
+        apiKey?: string;
+        analysisDepth?: 'quick' | 'balanced' | 'deep';
+        maxEvidence?: number;
         maxActions?: number;
       }) => Promise<AiAssistantResult>;
 

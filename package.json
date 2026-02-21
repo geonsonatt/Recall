@@ -8,7 +8,7 @@
     "clean": "node scripts/clean-generated.mjs",
     "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
     "dev:renderer": "vite --config app/renderer/vite.config.mjs",
-    "dev:electron": "wait-on tcp:5180 && env -u ELECTRON_RUN_AS_NODE -u ELECTRON_NO_ATTACH_CONSOLE -u GIO_MODULE_DIR -u GIO_EXTRA_MODULES -u GTK_PATH -u SNAP -u SNAP_NAME VITE_DEV_SERVER_URL=http://localhost:5180 LIBVA_DRIVER_NAME=none ELECTRON_ENABLE_LOGGING=1 electron . --no-sandbox --disable-gpu --disable-accelerated-video-decode --disable-features=VaapiVideoDecoder,VaapiVideoEncoder,UseChromeOSDirectVideoDecoder",
+    "dev:electron": "wait-on tcp:5180 && node scripts/dev-electron.mjs",
     "dev:electron:snap": "wait-on tcp:${RECALL_UI_SNAP_PORT:-5180} && env -u ELECTRON_RUN_AS_NODE -u ELECTRON_NO_ATTACH_CONSOLE -u GIO_MODULE_DIR -u GIO_EXTRA_MODULES -u GTK_PATH -u SNAP -u SNAP_NAME RECALL_UI_SNAP=1 VITE_DEV_SERVER_URL=${VITE_DEV_SERVER_URL:-http://localhost:${RECALL_UI_SNAP_PORT:-5180}} LIBVA_DRIVER_NAME=none electron . --no-sandbox --disable-gpu --disable-accelerated-video-decode --disable-features=VaapiVideoDecoder,VaapiVideoEncoder,UseChromeOSDirectVideoDecoder",
     "ui:snap": "node scripts/ui-snap.mjs",
     "build": "npm run build:renderer",

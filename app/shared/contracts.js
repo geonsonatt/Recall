@@ -526,6 +526,9 @@ function validateChannelPayload(channel, payload) {
       setOptionalField(result, input, 'question', (value) =>
         ensureOptionalString(value, 'E_CONTRACT_INSIGHTS_AI', 'question'),
       );
+      setOptionalField(result, input, 'task', (value) =>
+        ensureOptionalString(value, 'E_CONTRACT_INSIGHTS_AI', 'task'),
+      );
       setOptionalField(result, input, 'mode', (value) =>
         ensureOptionalEnum(
           value,
@@ -537,10 +540,30 @@ function validateChannelPayload(channel, payload) {
       setOptionalField(result, input, 'provider', (value) =>
         ensureOptionalEnum(
           value,
-          ['auto', 'local', 'ollama', 'openai'],
+          ['auto', 'local', 'api'],
           'E_CONTRACT_INSIGHTS_AI',
           'provider',
         ),
+      );
+      setOptionalField(result, input, 'model', (value) =>
+        ensureOptionalString(value, 'E_CONTRACT_INSIGHTS_AI', 'model'),
+      );
+      setOptionalField(result, input, 'apiUrl', (value) =>
+        ensureOptionalString(value, 'E_CONTRACT_INSIGHTS_AI', 'apiUrl'),
+      );
+      setOptionalField(result, input, 'apiKey', (value) =>
+        ensureOptionalString(value, 'E_CONTRACT_INSIGHTS_AI', 'apiKey'),
+      );
+      setOptionalField(result, input, 'analysisDepth', (value) =>
+        ensureOptionalEnum(
+          value,
+          ['quick', 'balanced', 'deep'],
+          'E_CONTRACT_INSIGHTS_AI',
+          'analysisDepth',
+        ),
+      );
+      setOptionalField(result, input, 'maxEvidence', (value) =>
+        ensureOptionalInt(value, 'E_CONTRACT_INSIGHTS_AI', 'maxEvidence', 8, 64),
       );
       setOptionalField(result, input, 'maxActions', (value) =>
         ensureOptionalInt(value, 'E_CONTRACT_INSIGHTS_AI', 'maxActions', 3, 20),

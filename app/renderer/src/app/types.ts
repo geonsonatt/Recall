@@ -275,4 +275,17 @@ export interface AiAssistantResult {
     tags: string[];
     createdAt?: string;
   }>;
+  engine?: {
+    runtime: 'api' | 'local';
+    model: string;
+    endpoint?: string;
+    depth: 'quick' | 'balanced' | 'deep';
+    warnings: string[];
+    promptChars: number;
+    evidenceUsed: number;
+    evalCount?: number;
+    promptEvalCount?: number;
+    latencyMs?: number;
+    installHint?: string;
+  };
 }
