@@ -3,6 +3,7 @@ dist/
 release/
 research/
 coverage/
+artifacts/
 .vite/
 *.AppImage
 *.dmg

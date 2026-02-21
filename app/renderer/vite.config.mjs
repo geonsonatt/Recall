@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
+import react from '@vitejs/plugin-react-swc';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -9,6 +10,7 @@ export default defineConfig({
   root: __dirname,
   publicDir: false,
   plugins: [
+    react(),
     viteStaticCopy({
       targets: [
         {

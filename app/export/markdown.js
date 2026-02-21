@@ -12,7 +12,11 @@ function repairPdfTextArtifacts(value) {
     .replace(/\u00ad/g, '')
     .replace(/\u00a0/g, ' ')
     .replace(/([\p{L}\p{N}])[-‐‑]\s+([\p{L}\p{N}])/gu, '$1$2')
-    .replace(/(^|[\s([{«"'])([БГДЖЗЙЛМНПРТФХЦЧШЩЬЪЫЭЮ])\s+([а-яё]{2,})/gu, '$1$2$3')
+    .replace(
+      /(^|[\s([{«"'])((?:[А-ЯЁ][ \t]){2,}[А-ЯЁ])(?=$|[\s,.;:!?»)\]}\u2026])/gu,
+      (_match, prefix, word) => `${prefix}${word.replace(/[ \t]/g, '')}`,
+    )
+    .replace(/(^|[\s([{«"'])([А-ЯЁA-Z])\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z]{1,})/gu, '$1$2$3')
     .replace(/\s+([,.;:!?»)\]}\u2026])/g, '$1')
     .replace(/([«([{])\s+/g, '$1');
 }

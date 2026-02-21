@@ -1,9 +1,11 @@
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const {
   ensureStorage,
+  loadDB,
   listDocuments,
   importDocumentFromPath,
   importDocumentsFromPaths,
@@ -34,135 +36,196 @@ const {
 } = require('../data/storage');
 const { buildAnnotatedPdf } = require('../export/annotatedPdf');
 const { buildHighlightsMarkdown } = require('../export/markdown');
-const { checkForUpdates, normalizeHttpUrl } = require('./updateChecker');
+const {
+  buildObsidianBundleFiles,
+  buildNotionBundleFiles,
+  writeBundleFiles,
+} = require('../export/bundles');
+const {
+  generateSrsDeck,
+  applySrsReviewGrade,
+  buildReadingDigest,
+  buildKnowledgeGraph,
+  askLibrary,
+  summarizeHighlights,
+} = require('../intelligence/insights');
+const { generateAiAssistantBrief } = require('../intelligence/aiAssistant');
+const {
+  sanitizeFileName,
+  getDefaultExportBaseName,
+  timestampForFile,
+  normalizeIds,
+  pickOwnProps,
+  isTrustedIpcSender,
+  assertTrustedIpcSender,
+} = require('./ipcUtils');
+const {
+  IPC_CHANNELS,
+  IPC_EVENTS,
+  validateChannelPayload,
+  ensureAppError,
+} = require('../shared/contracts');
+const {
+  initializeDiagnosticsTray,
+  setDiagnosticsTrayCapture,
+  appendDiagnosticsEvents,
+} = require('./diagnosticsTray');
+
+const MAIN_DEBUG_BOOT_ENABLED = process.env.RECALL_DEBUG_BOOT === '1';
+const MAIN_DEBUG_BOOT_PATH = path.join(process.cwd(), '.recall-main.log');
+
+function debugBoot(message) {
+  if (!MAIN_DEBUG_BOOT_ENABLED) {
+    return;
+  }
+  try {
+    fsSync.appendFileSync(
+      MAIN_DEBUG_BOOT_PATH,
+      `[${new Date().toISOString()}] ${String(message)}\n`,
+      'utf8',
+    );
+  } catch {
+    // ignore debug write errors
+  }
+}
+
+debugBoot('main module loaded');
 
 let mainWindow;
 let storagePaths;
-let updateCheckPromise = null;
-let latestUpdateState = {
-  status: 'idle',
-  updateAvailable: false,
-  currentVersion: app.getVersion(),
-  latestVersion: app.getVersion(),
-  manifestUrl: '',
-  checkedAt: null,
-  downloadUrl: '',
-  notes: '',
-  publishedAt: '',
-  error: '',
-};
+let pendingExternalDeepLink = null;
+const IS_DEV = Boolean(process.env.VITE_DEV_SERVER_URL);
+const IS_UI_SNAP = process.env.RECALL_UI_SNAP === '1';
+const DEEP_LINK_PREFIX = 'recall://';
+const SUPPORTED_APP_VIEWS = new Set(['library', 'reader', 'highlights', 'insights']);
 
-app.disableHardwareAcceleration();
-
-function sanitizeFileName(value) {
-  return String(value ?? '')
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+const isSnapRuntime = Boolean(process.env.SNAP || process.env.SNAP_NAME);
+if (process.env.RECALL_DISABLE_GPU === '1' || isSnapRuntime) {
+  app.disableHardwareAcceleration();
 }
 
-function getDefaultExportBaseName(document) {
-  return sanitizeFileName(document.title) || `документ-${document.id.slice(0, 8)}`;
-}
-
-function timestampForFile() {
-  const now = new Date();
-  const pad = (value) => String(value).padStart(2, '0');
-  return [
-    now.getFullYear(),
-    pad(now.getMonth() + 1),
-    pad(now.getDate()),
-    '-',
-    pad(now.getHours()),
-    pad(now.getMinutes()),
-    pad(now.getSeconds()),
-  ].join('');
-}
-
-function normalizeIds(values) {
-  if (!Array.isArray(values)) {
-    return [];
+function normalizeExternalDeepLink(rawLink) {
+  const raw = String(rawLink ?? '').trim();
+  if (!raw || !raw.startsWith(DEEP_LINK_PREFIX)) {
+    return null;
   }
-  const unique = new Set(values.map((value) => String(value)).filter(Boolean));
-  return [...unique];
-}
-
-function resolveManifestUrl(settings, overrideUrl = '') {
-  const fromOverride = normalizeHttpUrl(overrideUrl);
-  if (fromOverride) {
-    return fromOverride;
-  }
-
-  const fromSettings = normalizeHttpUrl(settings?.updates?.manifestUrl);
-  if (fromSettings) {
-    return fromSettings;
-  }
-
-  return normalizeHttpUrl(process.env.RECALL_UPDATE_MANIFEST_URL);
-}
-
-function sendUpdateStateToRenderer() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return;
-  }
-
-  mainWindow.webContents.send('app:update-state-changed', latestUpdateState);
-}
-
-async function runUpdateCheck(options = {}) {
-  if (!storagePaths) {
-    return latestUpdateState;
-  }
-
-  if (updateCheckPromise) {
-    return updateCheckPromise;
-  }
-
-  updateCheckPromise = (async () => {
-    const settings = await getSettings(storagePaths);
-    const autoCheckEnabled = settings?.updates?.autoCheck !== false;
-    const shouldRespectAutoCheck = !Boolean(options?.manual);
-    const manifestUrl = resolveManifestUrl(settings, options?.manifestUrl);
-
-    if (shouldRespectAutoCheck && !autoCheckEnabled) {
-      latestUpdateState = {
-        status: 'disabled',
-        updateAvailable: false,
-        currentVersion: app.getVersion(),
-        latestVersion: app.getVersion(),
-        manifestUrl,
-        checkedAt: new Date().toISOString(),
-        downloadUrl: '',
-        notes: '',
-        publishedAt: '',
-        error: 'Автопроверка обновлений отключена в настройках.',
-      };
-      sendUpdateStateToRenderer();
-      return latestUpdateState;
-    }
-
-    const checkResult = await checkForUpdates({
-      manifestUrl,
-      currentVersion: app.getVersion(),
-      platform: process.platform,
-    });
-
-    latestUpdateState = {
-      ...checkResult,
-      autoCheckEnabled,
-    };
-    sendUpdateStateToRenderer();
-    return latestUpdateState;
-  })();
 
   try {
-    return await updateCheckPromise;
-  } finally {
-    updateCheckPromise = null;
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'recall:') {
+      return null;
+    }
+
+    const viewFromParams = String(parsed.searchParams.get('view') || '').trim().toLowerCase();
+    if (viewFromParams && !SUPPORTED_APP_VIEWS.has(viewFromParams)) {
+      parsed.searchParams.delete('view');
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
   }
+}
+
+function resolveDeepLinkView(urlObject) {
+  const viewFromParams = String(urlObject.searchParams.get('view') || '').trim().toLowerCase();
+  if (SUPPORTED_APP_VIEWS.has(viewFromParams)) {
+    return viewFromParams;
+  }
+
+  const host = String(urlObject.hostname || '').trim().toLowerCase();
+  if (SUPPORTED_APP_VIEWS.has(host)) {
+    return host;
+  }
+
+  const pathSegment = String(urlObject.pathname || '')
+    .replace(/^\/+/, '')
+    .split('/')[0]
+    .trim()
+    .toLowerCase();
+  if (SUPPORTED_APP_VIEWS.has(pathSegment)) {
+    return pathSegment;
+  }
+
+  return 'library';
+}
+
+function externalDeepLinkToHash(rawLink) {
+  const normalized = normalizeExternalDeepLink(rawLink);
+  if (!normalized) {
+    return '';
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    const view = resolveDeepLinkView(parsed);
+    const params = new URLSearchParams(parsed.search);
+    params.delete('view');
+    const query = params.toString();
+    return `#/${view}${query ? `?${query}` : ''}`;
+  } catch {
+    return '';
+  }
+}
+
+function findExternalDeepLink(argv = []) {
+  if (!Array.isArray(argv)) {
+    return null;
+  }
+  for (const arg of argv) {
+    const normalized = normalizeExternalDeepLink(arg);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function flushPendingExternalDeepLink() {
+  if (!pendingExternalDeepLink || !mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  if (mainWindow.webContents.isLoadingMainFrame()) {
+    return;
+  }
+  mainWindow.webContents.send(IPC_EVENTS.APP_DEEP_LINK, pendingExternalDeepLink);
+  pendingExternalDeepLink = null;
+}
+
+function handleExternalDeepLink(rawLink) {
+  const normalized = normalizeExternalDeepLink(rawLink);
+  if (!normalized) {
+    return false;
+  }
+
+  pendingExternalDeepLink = normalized;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return true;
+  }
+
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.show();
+  mainWindow.focus();
+  flushPendingExternalDeepLink();
+  return true;
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.show();
+  mainWindow.focus();
 }
 
 function createMainWindow() {
+  debugBoot('createMainWindow called');
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 900,
@@ -178,64 +241,434 @@ function createMainWindow() {
   });
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
-
-  if (devServerUrl) {
-    mainWindow.loadURL(devServerUrl);
-  } else {
-    mainWindow.loadFile(path.join(app.getAppPath(), 'dist/renderer/index.html'));
+  const initialDeepLinkHash = externalDeepLinkToHash(pendingExternalDeepLink);
+  if (initialDeepLinkHash) {
+    pendingExternalDeepLink = null;
   }
 
+  if (devServerUrl) {
+    const targetUrl = initialDeepLinkHash ? `${devServerUrl}${initialDeepLinkHash}` : devServerUrl;
+    debugBoot(`loadURL ${targetUrl}`);
+    mainWindow.loadURL(targetUrl);
+  } else {
+    debugBoot('loadFile dist/renderer/index.html');
+    const filePath = path.join(app.getAppPath(), 'dist/renderer/index.html');
+    if (initialDeepLinkHash) {
+      mainWindow.loadFile(filePath, {
+        hash: initialDeepLinkHash.slice(1),
+      });
+    } else {
+      mainWindow.loadFile(filePath);
+    }
+  }
+
+  mainWindow.once('ready-to-show', () => {
+    debugBoot('ready-to-show');
+    if (IS_DEV) {
+      console.log('[main] Окно готово, показываю приложение');
+    }
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(
+      `[main] Не удалось загрузить окно: code=${errorCode} ${errorDescription}; url=${validatedURL}`,
+    );
+  });
+
   mainWindow.webContents.on('did-finish-load', () => {
-    sendUpdateStateToRenderer();
+    flushPendingExternalDeepLink();
+  });
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[main] Renderer process завершился:', details?.reason || 'unknown');
+  });
+
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
 }
 
-function isTrustedIpcSender(event) {
-  const senderUrl = String(event?.senderFrame?.url ?? event?.sender?.getURL?.() ?? '');
-  if (!senderUrl) {
-    return false;
-  }
+async function waitForRendererReady(windowRef, timeoutMs = 20000) {
+  const script = `
+    new Promise((resolve, reject) => {
+      const timeoutAt = Date.now() + ${Number(timeoutMs)};
+      const check = () => {
+        const root = document.querySelector('#app .app-root');
+        const tabs = document.querySelector('[role="tablist"]');
+        if (root && tabs) {
+          if (document.fonts?.ready?.then) {
+            document.fonts.ready.then(() => {
+              requestAnimationFrame(() => resolve(true));
+            }).catch(() => resolve(true));
+            return;
+          }
+          requestAnimationFrame(() => resolve(true));
+          return;
+        }
 
-  if (senderUrl.startsWith('file://')) {
-    return true;
-  }
+        if (Date.now() >= timeoutAt) {
+          reject(new Error('UI не успела инициализироваться.'));
+          return;
+        }
 
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
-  if (!devServerUrl) {
-    return false;
-  }
+        setTimeout(check, 120);
+      };
 
-  try {
-    const senderOrigin = new URL(senderUrl).origin;
-    const allowedOrigin = new URL(devServerUrl).origin;
-    return senderOrigin === allowedOrigin;
-  } catch {
-    return false;
-  }
+      check();
+    });
+  `;
+
+  await windowRef.webContents.executeJavaScript(script, true);
 }
 
-function assertTrustedIpcSender(event, channel) {
-  if (isTrustedIpcSender(event)) {
-    return;
+async function waitForSelector(windowRef, selector, timeoutMs = 10000) {
+  const script = `
+    new Promise((resolve) => {
+      const timeoutAt = Date.now() + ${Number(timeoutMs)};
+      const target = ${JSON.stringify(String(selector || ''))};
+      const check = () => {
+        if (document.querySelector(target)) {
+          resolve(true);
+          return;
+        }
+        if (Date.now() >= timeoutAt) {
+          resolve(false);
+          return;
+        }
+        setTimeout(check, 120);
+      };
+      check();
+    });
+  `;
+
+  return Boolean(await windowRef.webContents.executeJavaScript(script, true));
+}
+
+async function waitForReaderIdle(windowRef, timeoutMs = 18000) {
+  const script = `
+    new Promise((resolve) => {
+      const timeoutAt = Date.now() + ${Number(timeoutMs)};
+      const check = () => {
+        const host = document.querySelector('#reader-webviewer-host');
+        const hasIframe = Boolean(host && host.querySelector('iframe'));
+        const hasViewerContent = Boolean(host && (host.childElementCount > 0 || hasIframe));
+        const pageInput = document.querySelector('.reader-page-label input');
+        const readerTitle = document.querySelector('.reader-header-main h1');
+        const hasReaderMeta = Boolean(pageInput && String(pageInput.value || '').trim() && readerTitle);
+        const loadingOverlay = document.querySelector('.reader-overlay:not(.error)');
+        const errorOverlay = document.querySelector('.reader-overlay.error');
+        const isReady = Boolean(host && !loadingOverlay && (hasViewerContent || hasReaderMeta));
+        if (isReady) {
+          resolve({
+            ready: true,
+            error: Boolean(errorOverlay),
+            hasHost: Boolean(host),
+            hasViewerContent,
+            hasIframe,
+            hasReaderMeta,
+            loadingOverlay: Boolean(loadingOverlay),
+          });
+          return;
+        }
+        if (Date.now() >= timeoutAt) {
+          resolve({
+            ready: false,
+            error: Boolean(errorOverlay),
+            hasHost: Boolean(host),
+            hasViewerContent,
+            hasIframe,
+            hasReaderMeta,
+            loadingOverlay: Boolean(loadingOverlay),
+          });
+          return;
+        }
+        setTimeout(check, 180);
+      };
+
+      check();
+    });
+  `;
+
+  return windowRef.webContents.executeJavaScript(script, true);
+}
+
+async function readReaderUiState(windowRef) {
+  const script = `
+    (() => {
+      const pageInput = document.querySelector('.reader-page-label input');
+      const titleNode = document.querySelector('.reader-header-main h1');
+      const progressNode = document.querySelector('.reader-header-main .muted');
+      return {
+        pageInput: pageInput ? String(pageInput.value || '') : '',
+        title: titleNode ? String(titleNode.textContent || '').trim() : '',
+        progressText: progressNode ? String(progressNode.textContent || '').trim() : '',
+      };
+    })();
+  `;
+
+  return windowRef.webContents.executeJavaScript(script, true);
+}
+
+async function readHighlightsUiState(windowRef) {
+  const script = `
+    (() => {
+      const highlightItems = Array.from(document.querySelectorAll('.highlights-list .highlight-item'));
+      const jumpButtons = Array.from(document.querySelectorAll('button'))
+        .filter((node) => String(node.textContent || '').replace(/\\s+/g, ' ').trim() === 'Перейти');
+      const emptyState = document.querySelector('.highlights-groups .empty-state');
+      return {
+        highlightItems: highlightItems.length,
+        jumpButtons: jumpButtons.length,
+        hasEmptyState: Boolean(emptyState),
+      };
+    })();
+  `;
+
+  return windowRef.webContents.executeJavaScript(script, true);
+}
+
+async function clickButtonByText(windowRef, text) {
+  const script = `
+    (() => {
+      const target = ${JSON.stringify(String(text || ''))};
+      const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"]'));
+      const match = nodes.find((node) => {
+        if (node instanceof HTMLButtonElement && node.disabled) {
+          return false;
+        }
+        if (String(node.getAttribute('aria-disabled') || '') === 'true') {
+          return false;
+        }
+        return normalize(node.textContent) === target;
+      });
+      if (!match) {
+        return false;
+      }
+      match.click();
+      return true;
+    })();
+  `;
+
+  return Boolean(await windowRef.webContents.executeJavaScript(script, true));
+}
+
+async function captureWindow(windowRef, outputDir, fileName) {
+  await fs.mkdir(outputDir, { recursive: true });
+  const targetPath = path.join(outputDir, fileName);
+  const image = await windowRef.webContents.capturePage();
+  await fs.writeFile(targetPath, image.toPNG());
+  return targetPath;
+}
+
+async function waitForPaint(windowRef, frames = 2) {
+  const safeFrames = Math.max(1, Math.trunc(Number(frames || 1)));
+  const script = `
+    new Promise((resolve) => {
+      let remaining = ${safeFrames};
+      const next = () => {
+        if (remaining <= 0) {
+          resolve(true);
+          return;
+        }
+        remaining -= 1;
+        requestAnimationFrame(next);
+      };
+      next();
+    });
+  `;
+  await windowRef.webContents.executeJavaScript(script, true);
+}
+
+async function readTopTabsState(windowRef) {
+  const script = `
+    (() => {
+      return Array.from(document.querySelectorAll('[role="tab"]')).map((node) => ({
+        text: String(node.textContent || '').trim(),
+        ariaSelected: String(node.getAttribute('aria-selected') || ''),
+        dataActive: String(node.getAttribute('data-active') || ''),
+        className: String(node.className || ''),
+        disabled: Boolean(node.hasAttribute('disabled')),
+      }));
+    })();
+  `;
+
+  return windowRef.webContents.executeJavaScript(script, true);
+}
+
+async function runUiSnapshotMode() {
+  const outputDir =
+    String(process.env.RECALL_UI_SNAP_OUT_DIR || '').trim() ||
+    path.join(app.getPath('temp'), `recall-ui-snap-${timestampForFile()}`);
+
+  storagePaths = await ensureStorage(app.getPath('userData'));
+  registerIpc();
+
+  const windowRef = new BrowserWindow({
+    width: 1540,
+    height: 980,
+    show: true,
+    backgroundColor: '#f6f6f4',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+
+  const manifest = {
+    createdAt: new Date().toISOString(),
+    outputDir,
+    captures: [],
+    notes: [],
+    tabsState: {},
+    readerState: {},
+    highlightsState: {},
+  };
+
+  let snapError = null;
+
+  try {
+    if (process.env.VITE_DEV_SERVER_URL) {
+      await windowRef.loadURL(process.env.VITE_DEV_SERVER_URL);
+    } else {
+      await windowRef.loadFile(path.join(app.getAppPath(), 'dist/renderer/index.html'));
+    }
+
+    await waitForRendererReady(windowRef);
+    await sleep(500);
+    await waitForPaint(windowRef, 3);
+    manifest.tabsState.library = await readTopTabsState(windowRef);
+
+    const libraryCapture = await captureWindow(windowRef, outputDir, '01-library.png');
+    manifest.captures.push(libraryCapture);
+
+    const openedReader = await clickButtonByText(windowRef, 'Открыть');
+    if (!openedReader) {
+      manifest.notes.push('Кнопка "Открыть" не найдена. Вероятно, библиотека пуста.');
+    } else {
+      await waitForSelector(windowRef, '#reader-webviewer-host', 14000);
+      const readerIdle = await waitForReaderIdle(windowRef, 22000);
+      manifest.readerState.readerFirstOpen = {
+        ...(readerIdle || {}),
+        ...(await readReaderUiState(windowRef)),
+      };
+      if (!readerIdle?.ready) {
+        manifest.notes.push('Reader не перешёл в готовое состояние перед первым скриншотом.');
+      }
+      await sleep(600);
+      await waitForPaint(windowRef, 3);
+      manifest.tabsState.reader = await readTopTabsState(windowRef);
+      const readerCapture = await captureWindow(windowRef, outputDir, '02-reader.png');
+      manifest.captures.push(readerCapture);
+
+      const openedHighlights =
+        (await clickButtonByText(windowRef, 'Вкладка хайлайтов')) ||
+        (await clickButtonByText(windowRef, 'Хайлайты'));
+
+      if (!openedHighlights) {
+        manifest.notes.push('Не удалось переключиться на экран хайлайтов.');
+      } else {
+        await waitForSelector(windowRef, '.highlights-filters', 9000);
+        await sleep(550);
+        await waitForPaint(windowRef, 3);
+        manifest.tabsState.highlights = await readTopTabsState(windowRef);
+        manifest.highlightsState = await readHighlightsUiState(windowRef);
+        const highlightsCapture = await captureWindow(windowRef, outputDir, '03-highlights.png');
+        manifest.captures.push(highlightsCapture);
+        manifest.tabsState.highlightsAfterCapture = await readTopTabsState(windowRef);
+
+        const hasJumpTargets = Number(manifest.highlightsState?.jumpButtons || 0) > 0;
+        if (!hasJumpTargets) {
+          manifest.readerState.jumpFromHighlightsClicked = false;
+          manifest.notes.push('Переход по хайлайту пропущен: нет карточек с кнопкой "Перейти".');
+        } else {
+          const jumpedFromHighlights = await clickButtonByText(windowRef, 'Перейти');
+          manifest.readerState.jumpFromHighlightsClicked = jumpedFromHighlights;
+          if (jumpedFromHighlights) {
+            await waitForSelector(windowRef, '#reader-webviewer-host', 9000);
+            const readerIdleAfterJump = await waitForReaderIdle(windowRef, 18000);
+            manifest.readerState.afterHighlightJump = {
+              ...(readerIdleAfterJump || {}),
+              ...(await readReaderUiState(windowRef)),
+            };
+            await sleep(420);
+            await waitForPaint(windowRef, 3);
+            manifest.tabsState.readerAfterJump = await readTopTabsState(windowRef);
+            const readerAfterJumpCapture = await captureWindow(
+              windowRef,
+              outputDir,
+              '04-reader-after-highlight-jump.png',
+            );
+            manifest.captures.push(readerAfterJumpCapture);
+          } else {
+            manifest.notes.push('Не удалось нажать кнопку "Перейти" на экране хайлайтов.');
+          }
+        }
+      }
+    }
+    console.log(`[ui:snap] Скриншоты сохранены в ${outputDir}`);
+  } catch (error) {
+    snapError = error;
+    manifest.notes.push(`UI snap error: ${String(error?.message || error)}`);
+  } finally {
+    try {
+      await fs.writeFile(
+        path.join(outputDir, 'manifest.json'),
+        JSON.stringify(manifest, null, 2),
+        'utf8',
+      );
+    } catch (manifestError) {
+      console.error('[ui:snap] Не удалось сохранить manifest:', manifestError);
+    }
+
+    if (!windowRef.isDestroyed()) {
+      windowRef.destroy();
+    }
   }
 
-  const senderUrl = String(event?.senderFrame?.url ?? event?.sender?.getURL?.() ?? 'unknown');
-  throw new Error(`Недоверенный IPC источник для "${channel}": ${senderUrl}`);
+  if (snapError) {
+    throw snapError;
+  }
 }
 
 function registerTrustedIpcHandle(channel, handler) {
   ipcMain.handle(channel, async (event, ...args) => {
     assertTrustedIpcSender(event, channel);
-    return handler(event, ...args);
+    try {
+      return await handler(event, ...args);
+    } catch (error) {
+      const fallbackCode = `E_IPC_${String(channel).replace(/[^A-Za-z0-9]+/g, '_').toUpperCase()}`;
+      throw ensureAppError(error, fallbackCode);
+    }
   });
 }
 
+function filterBundleDocuments(documents, documentIds) {
+  const normalizedIds = Array.isArray(documentIds)
+    ? [...new Set(documentIds.map((id) => String(id)).filter(Boolean))]
+    : [];
+
+  if (normalizedIds.length === 0) {
+    return [...documents];
+  }
+
+  const allowed = new Set(normalizedIds);
+  return documents.filter((document) => allowed.has(String(document.id)));
+}
+
 function registerIpc() {
-  registerTrustedIpcHandle('library:list-documents', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_LIST_DOCUMENTS, async () => {
     return listDocuments(storagePaths);
   });
 
-  registerTrustedIpcHandle('library:import-pdf', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_IMPORT_PDF, async () => {
     const result = await dialog.showOpenDialog({
       title: 'Импорт PDF',
       properties: ['openFile'],
@@ -256,9 +689,10 @@ function registerIpc() {
     };
   });
 
-  registerTrustedIpcHandle('library:import-pdf-paths', async (_event, payload) => {
-    const paths = Array.isArray(payload?.paths)
-      ? payload.paths.map((item) => String(item)).filter(Boolean)
+  registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_IMPORT_PDF_PATHS, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.LIBRARY_IMPORT_PDF_PATHS, payload);
+    const paths = Array.isArray(validated?.paths)
+      ? validated.paths.map((item) => String(item)).filter(Boolean)
       : [];
     const pdfPaths = paths.filter((filePath) => filePath.toLowerCase().endsWith('.pdf'));
 
@@ -273,19 +707,13 @@ function registerIpc() {
     return importDocumentsFromPaths(storagePaths, pdfPaths);
   });
 
-  registerTrustedIpcHandle('library:update-document-meta', async (_event, payload) => {
-    const documentId = String(payload?.documentId ?? '');
-    if (!documentId) {
-      throw new Error('Не передан идентификатор документа.');
-    }
-
-    return updateDocumentMeta(storagePaths, documentId, {
-      isPinned: payload?.isPinned,
-      collectionId: payload?.collectionId,
-    });
+  registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_UPDATE_DOCUMENT_META, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.LIBRARY_UPDATE_DOCUMENT_META, payload);
+    const patch = pickOwnProps(validated, ['isPinned', 'collectionId']);
+    return updateDocumentMeta(storagePaths, validated.documentId, patch);
   });
 
-  registerTrustedIpcHandle('library:delete-document', async (_event, documentId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_DELETE_DOCUMENT, async (_event, documentId) => {
     const id = String(documentId ?? '');
     if (!id) {
       throw new Error('Не передан идентификатор документа.');
@@ -294,37 +722,29 @@ function registerIpc() {
     return deleteDocument(storagePaths, id);
   });
 
-  registerTrustedIpcHandle('library:reset-reading-state', async (_event, payload) => {
-    const documentId = String(payload?.documentId ?? '');
-    if (!documentId) {
-      throw new Error('Не передан идентификатор документа.');
-    }
-
-    return resetDocumentReadingState(storagePaths, documentId);
+  registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_RESET_READING_STATE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.LIBRARY_RESET_READING_STATE, payload);
+    return resetDocumentReadingState(storagePaths, validated.documentId);
   });
 
-  registerTrustedIpcHandle('document:get', async (_event, documentId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.DOCUMENT_GET, async (_event, documentId) => {
     return getDocumentById(storagePaths, String(documentId));
   });
 
-  registerTrustedIpcHandle('document:update-reading-state', async (_event, payload) => {
-    const documentId = String(payload?.documentId ?? '');
-    if (!documentId) {
-      throw new Error('Не передан идентификатор документа.');
-    }
-
-    return updateDocumentReadingState(storagePaths, documentId, {
-      pageIndex: payload?.pageIndex,
-      totalPages: payload?.totalPages,
-      scale: payload?.scale,
-      lastOpenedAt: payload?.lastOpenedAt,
-      readingSeconds: payload?.readingSeconds,
-      pagesDelta: payload?.pagesDelta,
-      allowFirstPage: payload?.allowFirstPage,
+  registerTrustedIpcHandle(IPC_CHANNELS.DOCUMENT_UPDATE_READING_STATE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.DOCUMENT_UPDATE_READING_STATE, payload);
+    return updateDocumentReadingState(storagePaths, validated.documentId, {
+      pageIndex: validated.pageIndex,
+      totalPages: validated.totalPages,
+      scale: validated.scale,
+      lastOpenedAt: validated.lastOpenedAt,
+      readingSeconds: validated.readingSeconds,
+      pagesDelta: validated.pagesDelta,
+      allowFirstPage: validated.allowFirstPage,
     });
   });
 
-  registerTrustedIpcHandle('document:read-pdf-bytes', async (_event, documentId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.DOCUMENT_READ_PDF_BYTES, async (_event, documentId) => {
     const document = await getDocumentById(storagePaths, String(documentId));
 
     if (!document) {
@@ -334,7 +754,7 @@ function registerIpc() {
     return fs.readFile(document.filePath);
   });
 
-  registerTrustedIpcHandle('highlight:list', async (_event, payload) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.HIGHLIGHT_LIST, async (_event, payload) => {
     const documentId =
       typeof payload === 'string'
         ? payload
@@ -347,7 +767,7 @@ function registerIpc() {
     });
   });
 
-  registerTrustedIpcHandle('highlight:list-all', async (_event, payload) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.HIGHLIGHT_LIST_ALL, async (_event, payload) => {
     return listAllHighlights(storagePaths, {
       documentId: payload?.documentId,
       since: payload?.since,
@@ -356,7 +776,7 @@ function registerIpc() {
     });
   });
 
-  registerTrustedIpcHandle('highlight:add', async (_event, payload) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.HIGHLIGHT_ADD, async (_event, payload) => {
     const documentId = String(payload?.documentId ?? '');
     const document = await getDocumentById(storagePaths, documentId);
 
@@ -380,26 +800,23 @@ function registerIpc() {
     return addHighlight(storagePaths, highlight);
   });
 
-  registerTrustedIpcHandle('highlight:update', async (_event, payload) => {
-    const highlightId = String(payload?.id ?? '');
-    if (!highlightId) {
-      throw new Error('Не передан идентификатор выделения.');
-    }
+  registerTrustedIpcHandle(IPC_CHANNELS.HIGHLIGHT_UPDATE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.HIGHLIGHT_UPDATE, payload);
 
-    const patch = {
-      pageIndex: payload?.pageIndex,
-      rects: payload?.rects,
-      selectedText: payload?.selectedText,
-      selectedRichText: payload?.selectedRichText,
-      color: payload?.color,
-      note: payload?.note,
-      tags: payload?.tags,
-    };
+    const patch = pickOwnProps(validated, [
+      'pageIndex',
+      'rects',
+      'selectedText',
+      'selectedRichText',
+      'color',
+      'note',
+      'tags',
+    ]);
 
-    return updateHighlight(storagePaths, highlightId, patch);
+    return updateHighlight(storagePaths, validated.id, patch);
   });
 
-  registerTrustedIpcHandle('highlight:delete', async (_event, highlightId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.HIGHLIGHT_DELETE, async (_event, highlightId) => {
     const id = String(highlightId ?? '');
     if (!id) {
       throw new Error('Не передан идентификатор выделения.');
@@ -408,16 +825,17 @@ function registerIpc() {
     return deleteHighlight(storagePaths, id);
   });
 
-  registerTrustedIpcHandle('highlight:delete-many', async (_event, payload) => {
-    const ids = normalizeIds(payload?.ids);
+  registerTrustedIpcHandle(IPC_CHANNELS.HIGHLIGHT_DELETE_MANY, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.HIGHLIGHT_DELETE_MANY, payload);
+    const ids = normalizeIds(validated?.ids);
     return deleteHighlightsByIds(storagePaths, ids);
   });
 
-  registerTrustedIpcHandle('bookmark:list', async (_event, documentId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.BOOKMARK_LIST, async (_event, documentId) => {
     return listBookmarks(storagePaths, String(documentId ?? ''));
   });
 
-  registerTrustedIpcHandle('bookmark:add', async (_event, payload) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.BOOKMARK_ADD, async (_event, payload) => {
     const documentId = String(payload?.documentId ?? '');
     if (!documentId) {
       throw new Error('Не передан идентификатор документа.');
@@ -437,66 +855,58 @@ function registerIpc() {
     });
   });
 
-  registerTrustedIpcHandle('bookmark:update', async (_event, payload) => {
-    const bookmarkId = String(payload?.id ?? '');
-    if (!bookmarkId) {
-      throw new Error('Не передан идентификатор закладки.');
-    }
-
-    return updateBookmark(storagePaths, bookmarkId, {
-      pageIndex: payload?.pageIndex,
-      label: payload?.label,
-    });
+  registerTrustedIpcHandle(IPC_CHANNELS.BOOKMARK_UPDATE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.BOOKMARK_UPDATE, payload);
+    const patch = pickOwnProps(validated, ['pageIndex', 'label']);
+    return updateBookmark(storagePaths, validated.id, patch);
   });
 
-  registerTrustedIpcHandle('bookmark:delete', async (_event, bookmarkId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.BOOKMARK_DELETE, async (_event, bookmarkId) => {
     return deleteBookmark(storagePaths, String(bookmarkId ?? ''));
   });
 
-  registerTrustedIpcHandle('bookmark:delete-many', async (_event, payload) => {
-    const ids = normalizeIds(payload?.ids);
+  registerTrustedIpcHandle(IPC_CHANNELS.BOOKMARK_DELETE_MANY, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.BOOKMARK_DELETE_MANY, payload);
+    const ids = normalizeIds(validated?.ids);
     return deleteBookmarksByIds(storagePaths, ids);
   });
 
-  registerTrustedIpcHandle('collection:list', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.COLLECTION_LIST, async () => {
     return listCollections(storagePaths);
   });
 
-  registerTrustedIpcHandle('collection:create', async (_event, payload) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.COLLECTION_CREATE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.COLLECTION_CREATE, payload);
     return createCollection(storagePaths, {
-      id: payload?.id || crypto.randomUUID(),
-      name: payload?.name,
+      id: validated?.id || crypto.randomUUID(),
+      name: validated?.name,
     });
   });
 
-  registerTrustedIpcHandle('collection:update', async (_event, payload) => {
-    const collectionId = String(payload?.id ?? '');
-    if (!collectionId) {
-      throw new Error('Не передан идентификатор коллекции.');
-    }
-
-    return updateCollection(storagePaths, collectionId, {
-      name: payload?.name,
+  registerTrustedIpcHandle(IPC_CHANNELS.COLLECTION_UPDATE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.COLLECTION_UPDATE, payload);
+    return updateCollection(storagePaths, validated.id, {
+      name: validated.name,
     });
   });
 
-  registerTrustedIpcHandle('collection:delete', async (_event, collectionId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.COLLECTION_DELETE, async (_event, collectionId) => {
     return deleteCollection(storagePaths, String(collectionId ?? ''));
   });
 
-  registerTrustedIpcHandle('settings:get', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.SETTINGS_GET, async () => {
     return getSettings(storagePaths);
   });
 
-  registerTrustedIpcHandle('settings:update', async (_event, payload) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.SETTINGS_UPDATE, async (_event, payload) => {
     return updateSettings(storagePaths, payload || {});
   });
 
-  registerTrustedIpcHandle('reading:get-overview', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.READING_GET_OVERVIEW, async () => {
     return getReadingOverview(storagePaths);
   });
 
-  registerTrustedIpcHandle('export:markdown', async (_event, documentId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.EXPORT_MARKDOWN, async (_event, documentId) => {
     const document = await getDocumentById(storagePaths, String(documentId));
     if (!document) {
       throw new Error('Документ не найден.');
@@ -524,23 +934,23 @@ function registerIpc() {
     };
   });
 
-  registerTrustedIpcHandle('export:markdown-custom', async (_event, payload) => {
-    const documentId = String(payload?.documentId ?? '');
-    const document = await getDocumentById(storagePaths, documentId);
+  registerTrustedIpcHandle(IPC_CHANNELS.EXPORT_MARKDOWN_CUSTOM, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.EXPORT_MARKDOWN_CUSTOM, payload);
+    const document = await getDocumentById(storagePaths, validated.documentId);
     if (!document) {
       throw new Error('Документ не найден.');
     }
 
     const highlights = await listHighlights(storagePaths, document.id, {
-      ids: payload?.highlightIds,
-      since: payload?.since,
-      tags: payload?.tags,
+      ids: validated.highlightIds,
+      since: validated.since,
+      tags: validated.tags,
     });
-    const markdownTitle = sanitizeFileName(payload?.title || document.title) || document.title;
+    const markdownTitle = sanitizeFileName(validated.title || document.title) || document.title;
     const markdown = buildHighlightsMarkdown(markdownTitle, highlights);
 
     const defaultBaseName = getDefaultExportBaseName(document);
-    const suffix = payload?.suffix ? `-${sanitizeFileName(payload.suffix)}` : '-custom';
+    const suffix = validated.suffix ? `-${sanitizeFileName(validated.suffix)}` : '-custom';
     const saveDialog = await dialog.showSaveDialog({
       title: 'Экспорт Markdown (выборка)',
       defaultPath: path.join(storagePaths.exportsDir, `${defaultBaseName}${suffix}.md`),
@@ -559,7 +969,7 @@ function registerIpc() {
     };
   });
 
-  registerTrustedIpcHandle('export:annotated-pdf', async (_event, documentId) => {
+  registerTrustedIpcHandle(IPC_CHANNELS.EXPORT_ANNOTATED_PDF, async (_event, documentId) => {
     const document = await getDocumentById(storagePaths, String(documentId));
 
     if (!document) {
@@ -589,44 +999,187 @@ function registerIpc() {
     };
   });
 
-  registerTrustedIpcHandle('app:get-version', async () => {
-    return {
-      version: app.getVersion(),
-    };
-  });
-
-  registerTrustedIpcHandle('app:get-update-state', async () => {
-    return latestUpdateState;
-  });
-
-  registerTrustedIpcHandle('app:check-for-updates', async (_event, payload) => {
-    return runUpdateCheck({
-      manual: Boolean(payload?.manual),
-      manifestUrl: payload?.manifestUrl,
-    });
-  });
-
-  registerTrustedIpcHandle('app:open-update-download', async (_event, payload) => {
-    const url = normalizeHttpUrl(
-      typeof payload === 'string' ? payload : payload?.url || latestUpdateState?.downloadUrl,
-    );
-
-    if (!url) {
-      throw new Error('Ссылка на обновление не найдена.');
+  registerTrustedIpcHandle(IPC_CHANNELS.EXPORT_OBSIDIAN_BUNDLE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.EXPORT_OBSIDIAN_BUNDLE, payload || {});
+    const db = await loadDB(storagePaths);
+    const documents = filterBundleDocuments(db.documents, validated.documentIds);
+    if (documents.length === 0) {
+      throw new Error('Нет документов для экспорта.');
     }
 
-    await shell.openExternal(url);
+    const documentIdSet = new Set(documents.map((item) => item.id));
+    const highlights = db.highlights.filter((item) => documentIdSet.has(item.documentId));
+
+    const srsDeck = generateSrsDeck(db, {
+      documentIds: [...documentIdSet],
+      dueOnly: false,
+      limit: 800,
+    });
+    const dailyDigest = buildReadingDigest(db, {
+      period: 'daily',
+      documentIds: [...documentIdSet],
+    });
+    const weeklyDigest = buildReadingDigest(db, {
+      period: 'weekly',
+      documentIds: [...documentIdSet],
+    });
+    const graph = buildKnowledgeGraph(db, {
+      documentIds: [...documentIdSet],
+      topConcepts: 96,
+      minEdgeWeight: 2,
+    });
+
+    const files = buildObsidianBundleFiles({
+      documents,
+      highlights,
+      srsDeck,
+      dailyDigest,
+      weeklyDigest,
+      graph,
+    });
+
+    const pick = await dialog.showOpenDialog({
+      title: 'Выберите папку для Obsidian bundle',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (pick.canceled || pick.filePaths.length === 0) {
+      return { canceled: true };
+    }
+
+    const written = await writeBundleFiles(
+      pick.filePaths[0],
+      `recall-obsidian-bundle-${timestampForFile()}`,
+      files,
+    );
+
     return {
-      ok: true,
-      url,
+      canceled: false,
+      bundlePath: written.bundlePath,
+      fileCount: written.fileCount,
+      documentCount: documents.length,
     };
   });
 
-  registerTrustedIpcHandle('app:get-storage-paths', () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.EXPORT_NOTION_BUNDLE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.EXPORT_NOTION_BUNDLE, payload || {});
+    const db = await loadDB(storagePaths);
+    const documents = filterBundleDocuments(db.documents, validated.documentIds);
+    if (documents.length === 0) {
+      throw new Error('Нет документов для экспорта.');
+    }
+
+    const documentIdSet = new Set(documents.map((item) => item.id));
+    const highlights = db.highlights.filter((item) => documentIdSet.has(item.documentId));
+
+    const srsDeck = generateSrsDeck(db, {
+      documentIds: [...documentIdSet],
+      dueOnly: false,
+      limit: 800,
+    });
+    const dailyDigest = buildReadingDigest(db, {
+      period: 'daily',
+      documentIds: [...documentIdSet],
+    });
+    const weeklyDigest = buildReadingDigest(db, {
+      period: 'weekly',
+      documentIds: [...documentIdSet],
+    });
+    const graph = buildKnowledgeGraph(db, {
+      documentIds: [...documentIdSet],
+      topConcepts: 96,
+      minEdgeWeight: 2,
+    });
+
+    const files = buildNotionBundleFiles({
+      documents,
+      highlights,
+      srsDeck,
+      dailyDigest,
+      weeklyDigest,
+      graph,
+    });
+
+    const pick = await dialog.showOpenDialog({
+      title: 'Выберите папку для Notion bundle',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (pick.canceled || pick.filePaths.length === 0) {
+      return { canceled: true };
+    }
+
+    const written = await writeBundleFiles(
+      pick.filePaths[0],
+      `recall-notion-bundle-${timestampForFile()}`,
+      files,
+    );
+
+    return {
+      canceled: false,
+      bundlePath: written.bundlePath,
+      fileCount: written.fileCount,
+      documentCount: documents.length,
+    };
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_GENERATE_SRS, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.INSIGHTS_GENERATE_SRS, payload || {});
+    const db = await loadDB(storagePaths);
+    return generateSrsDeck(db, validated);
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_BUILD_DIGEST, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.INSIGHTS_BUILD_DIGEST, payload || {});
+    const db = await loadDB(storagePaths);
+    return buildReadingDigest(db, validated);
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_BUILD_GRAPH, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.INSIGHTS_BUILD_GRAPH, payload || {});
+    const db = await loadDB(storagePaths);
+    return buildKnowledgeGraph(db, validated);
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_ASK_LIBRARY, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.INSIGHTS_ASK_LIBRARY, payload || {});
+    const db = await loadDB(storagePaths);
+    return askLibrary(db, validated);
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_SUMMARIZE_HIGHLIGHTS, async (_event, payload) => {
+    const validated = validateChannelPayload(
+      IPC_CHANNELS.INSIGHTS_SUMMARIZE_HIGHLIGHTS,
+      payload || {},
+    );
+    const db = await loadDB(storagePaths);
+    return summarizeHighlights(db, validated);
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_REVIEW_HIGHLIGHT, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.INSIGHTS_REVIEW_HIGHLIGHT, payload || {});
+    const db = await loadDB(storagePaths);
+    const highlight = db.highlights.find((item) => item.id === validated.highlightId);
+    if (!highlight) {
+      throw new Error('Хайлайт для review не найден.');
+    }
+
+    const patch = applySrsReviewGrade(highlight, {
+      grade: validated.grade,
+      nowIso: validated.nowIso,
+    });
+    return updateHighlight(storagePaths, validated.highlightId, patch);
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.INSIGHTS_AI_ASSISTANT, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.INSIGHTS_AI_ASSISTANT, payload || {});
+    const db = await loadDB(storagePaths);
+    return generateAiAssistantBrief(db, validated);
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.APP_GET_STORAGE_PATHS, () => {
     return getStoragePaths(storagePaths);
   });
 
-  registerTrustedIpcHandle('app:backup-data', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.APP_BACKUP_DATA, async () => {
     const pick = await dialog.showOpenDialog({
       title: 'Выберите папку для бэкапа',
       properties: ['openDirectory', 'createDirectory'],
@@ -671,7 +1224,7 @@ function registerIpc() {
     };
   });
 
-  registerTrustedIpcHandle('app:restore-data', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.APP_RESTORE_DATA, async () => {
     const pick = await dialog.showOpenDialog({
       title: 'Выберите папку бэкапа',
       properties: ['openDirectory'],
@@ -733,29 +1286,134 @@ function registerIpc() {
     };
   });
 
-  registerTrustedIpcHandle('app:reveal-user-data', async () => {
+  registerTrustedIpcHandle(IPC_CHANNELS.APP_REVEAL_USER_DATA, async () => {
     await shell.openPath(storagePaths.userDataPath);
     return { ok: true };
   });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.DIAGNOSTICS_SET_TRAY_CAPTURE, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.DIAGNOSTICS_SET_TRAY_CAPTURE, payload);
+    return setDiagnosticsTrayCapture(Boolean(validated.enabled));
+  });
+
+  registerTrustedIpcHandle(IPC_CHANNELS.DIAGNOSTICS_PUSH_EVENTS, async (_event, payload) => {
+    const validated = validateChannelPayload(IPC_CHANNELS.DIAGNOSTICS_PUSH_EVENTS, payload);
+    return appendDiagnosticsEvents(validated.events);
+  });
 }
 
-app.whenReady().then(async () => {
-  storagePaths = await ensureStorage(app.getPath('userData'));
-  registerIpc();
-  createMainWindow();
-  runUpdateCheck().catch(() => {
-    // Ignore startup check errors; renderer can request manual check.
-  });
+function startApp() {
+  const singleInstanceLock = app.requestSingleInstanceLock();
+  if (!singleInstanceLock) {
+    app.quit();
+    return;
+  }
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow();
+  pendingExternalDeepLink = findExternalDeepLink(process.argv);
+
+  app.on('second-instance', (_event, argv) => {
+    const externalLink = findExternalDeepLink(argv);
+    if (externalLink) {
+      handleExternalDeepLink(externalLink);
+      return;
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.show();
+      mainWindow.focus();
     }
   });
-});
+
+  app.on('open-url', (event, rawLink) => {
+    event.preventDefault();
+    handleExternalDeepLink(rawLink);
+  });
+
+  app
+    .whenReady()
+    .then(async () => {
+      debugBoot('app.whenReady resolved');
+      try {
+        app.setAsDefaultProtocolClient('recall');
+      } catch {
+        // ignore protocol registration failures
+      }
+      if (IS_DEV) {
+        console.log('[main] App готов, инициализирую storage и окно');
+      }
+      storagePaths = await ensureStorage(app.getPath('userData'));
+      debugBoot(`storage ready at ${storagePaths.userDataPath}`);
+      if (IS_DEV) {
+        console.log('[main] Storage готов:', storagePaths.userDataPath);
+      }
+      initializeDiagnosticsTray({
+        appName: 'Recall PDF',
+        userDataPath: storagePaths.userDataPath,
+        onOpenMainWindow: () => {
+          focusMainWindow();
+        },
+      });
+      registerIpc();
+      debugBoot('ipc registered');
+      createMainWindow();
+      flushPendingExternalDeepLink();
+
+      app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+          createMainWindow();
+        } else {
+          flushPendingExternalDeepLink();
+        }
+      });
+    })
+    .catch((error) => {
+      debugBoot(`startup error: ${error?.stack || error?.message || error}`);
+      console.error('[main] Критическая ошибка старта:', error);
+      try {
+        app.quit();
+      } catch {
+        // ignore
+      }
+    });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
 });
+
+if (IS_UI_SNAP) {
+  app
+    .whenReady()
+    .then(() => runUiSnapshotMode())
+    .then(() => {
+      app.quit();
+    })
+    .catch((error) => {
+      console.error('[ui:snap] Ошибка создания скриншотов:', error);
+      try {
+        app.exit(1);
+      } catch {
+        // ignore
+      }
+    });
+} else {
+  startApp();
+}
+
+module.exports = {
+  startApp,
+  __private: {
+    sanitizeFileName,
+    getDefaultExportBaseName,
+    timestampForFile,
+    normalizeIds,
+    pickOwnProps,
+    isTrustedIpcSender,
+    assertTrustedIpcSender,
+  },
+};

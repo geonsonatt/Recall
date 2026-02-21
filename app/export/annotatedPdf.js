@@ -4,6 +4,9 @@ const COLOR_MAP = {
   yellow: rgb(0.98, 0.9, 0.2),
   green: rgb(0.48, 0.86, 0.45),
   pink: rgb(0.98, 0.52, 0.75),
+  blue: rgb(0.42, 0.64, 0.98),
+  orange: rgb(0.96, 0.66, 0.28),
+  purple: rgb(0.68, 0.54, 0.98),
 };
 
 function clamp01(number) {

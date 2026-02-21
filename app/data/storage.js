@@ -3,20 +3,17 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const DB_FILE_NAME = 'db.json';
-const ALLOWED_COLORS = new Set(['yellow', 'green', 'pink']);
-const ALLOWED_THEMES = new Set(['light', 'sepia', 'contrast']);
+const ALLOWED_COLORS = new Set(['yellow', 'green', 'pink', 'blue', 'orange', 'purple']);
+const ALLOWED_THEMES = new Set(['white']);
 
 const DEFAULT_SETTINGS = {
-  theme: 'light',
+  theme: 'white',
   focusMode: false,
   goals: {
     pagesPerDay: 20,
     pagesPerWeek: 140,
   },
-  updates: {
-    manifestUrl: '',
-    autoCheck: true,
-  },
+  savedHighlightViews: [],
   savedHighlightQueries: [],
 };
 
@@ -28,7 +25,7 @@ const EMPTY_DB = {
   settings: {
     ...DEFAULT_SETTINGS,
     goals: { ...DEFAULT_SETTINGS.goals },
-    updates: { ...DEFAULT_SETTINGS.updates },
+    savedHighlightViews: [...DEFAULT_SETTINGS.savedHighlightViews],
     savedHighlightQueries: [...DEFAULT_SETTINGS.savedHighlightQueries],
   },
   readingLog: {},
@@ -70,42 +67,83 @@ function normalizeText(value) {
     .trim();
 }
 
-function normalizeHttpUrl(value) {
-  const raw = normalizeText(value);
-  if (!raw) {
-    return '';
-  }
-
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return '';
-    }
-    return parsed.toString();
-  } catch {
-    return '';
-  }
-}
-
 function repairPdfTextArtifacts(value) {
   return String(value ?? '')
     .normalize('NFKC')
     .replace(/[\u200b-\u200d\ufeff]/g, '')
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/\ufb00/g, 'ff')
+    .replace(/\ufb01/g, 'fi')
+    .replace(/\ufb02/g, 'fl')
+    .replace(/\ufb03/g, 'ffi')
+    .replace(/\ufb04/g, 'ffl')
     .replace(/([\p{L}\p{N}])\u00ad\s*([\p{L}\p{N}])/gu, '$1$2')
     .replace(/\u00ad/g, '')
     .replace(/\u00a0/g, ' ')
+    .replace(/[‐‑‒−]/g, '-')
     .replace(/([\p{L}\p{N}])[-‐‑]\s+([\p{L}\p{N}])/gu, '$1$2')
-    .replace(/(^|[\s([{«"'])([БГДЖЗЙЛМНПРТФХЦЧШЩЬЪЫЭЮ])\s+([а-яё]{2,})/gu, '$1$2$3')
+    .replace(/([\p{L}\p{N}])\s+\|\s+([\p{L}\p{N}])/gu, '$1 $2')
+    .replace(
+      /(^|[\s([{«"'])((?:[А-ЯЁ][ \t]){2,}[А-ЯЁ])(?=$|[\s,.;:!?»)\]}\u2026])/gu,
+      (_match, prefix, word) => `${prefix}${word.replace(/[ \t]/g, '')}`,
+    )
+    .replace(
+      /(^|[\s([{«"'])((?:[\p{L}\p{N}][ \t]){3,}[\p{L}\p{N}])(?=$|[\s,.;:!?»)\]}\u2026])/gu,
+      (_match, prefix, word) => `${prefix}${word.replace(/[ \t]/g, '')}`,
+    )
+    .replace(/(^|[\s([{«"'])([А-ЯЁA-Z])\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z]{1,})/gu, '$1$2$3')
+    .replace(/[|¦]{2,}/g, ' ')
+    .replace(/([!?.,;:]){2,}/g, '$1')
     .replace(/\s+([,.;:!?»)\]}\u2026])/g, '$1')
-    .replace(/([«([{])\s+/g, '$1');
+    .replace(/([«([{])\s+/g, '$1')
+    .replace(/[ \t]{2,}/g, ' ');
+}
+
+function normalizeOcrLineBreaks(value) {
+  const lines = String(value ?? '')
+    .split('\n')
+    .map((line) => line.replace(/[ \t\f\v]+/g, ' ').trim());
+  const merged = [];
+
+  for (const line of lines) {
+    if (!line) {
+      if (merged.length > 0 && merged[merged.length - 1] !== '') {
+        merged.push('');
+      }
+      continue;
+    }
+
+    const last = merged[merged.length - 1];
+    if (!last || last === '') {
+      merged.push(line);
+      continue;
+    }
+
+    const looksLikeHeading = /^[\p{Lu}\d][\p{Lu}\d .,:;!?"'()/-]{6,}$/u.test(line);
+    const shouldJoin =
+      !/[.!?;:»”"')\]]$/.test(last) &&
+      !/^[\u2022*#>]/.test(line) &&
+      !/^\d+[.)]\s/.test(line) &&
+      !looksLikeHeading;
+
+    if (shouldJoin) {
+      merged[merged.length - 1] = `${last} ${line}`;
+      continue;
+    }
+
+    merged.push(line);
+  }
+
+  return merged.join('\n').replace(/\n{3,}/g, '\n\n');
 }
 
 function normalizeHighlightText(value) {
   return normalizeText(
-    repairPdfTextArtifacts(String(value ?? ''))
-      .replace(/\r\n?/g, '\n')
+    normalizeOcrLineBreaks(repairPdfTextArtifacts(String(value ?? '')).replace(/\r\n?/g, '\n'))
       .replace(/[ \t]+\n/g, '\n')
-      .replace(/\n+/g, ' '),
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/\n/g, ' '),
   );
 }
 
@@ -272,6 +310,123 @@ function normalizeCollection(collection) {
   };
 }
 
+function normalizeSmartHighlightFilter(filter) {
+  const raw = filter && typeof filter === 'object' ? filter : {};
+  const colorRaw = String(raw.colorFilter ?? '').trim().toLowerCase();
+  const colorFilter = ALLOWED_COLORS.has(colorRaw) ? colorRaw : 'all';
+  const groupMode = String(raw.groupMode ?? '').trim().toLowerCase() === 'timeline' ? 'timeline' : 'document';
+
+  return {
+    search: normalizeText(raw.search).slice(0, 320),
+    documentFilter: normalizeText(raw.documentFilter) || 'all',
+    contextOnly: Boolean(raw.contextOnly),
+    colorFilter,
+    notesOnly: Boolean(raw.notesOnly),
+    inboxOnly: Boolean(raw.inboxOnly),
+    groupMode,
+  };
+}
+
+function normalizeSavedHighlightView(item) {
+  return {
+    id: String(item?.id || crypto.randomUUID()),
+    name: normalizeText(item?.name).slice(0, 80) || 'Представление',
+    createdAt: normalizeIsoString(item?.createdAt) || new Date().toISOString(),
+    updatedAt:
+      normalizeIsoString(item?.updatedAt) ||
+      normalizeIsoString(item?.createdAt) ||
+      new Date().toISOString(),
+    isPinned: Boolean(item?.isPinned),
+    lastUsedAt: normalizeIsoString(item?.lastUsedAt),
+    filter: normalizeSmartHighlightFilter(item?.filter),
+  };
+}
+
+function normalizeSavedHighlightViews(list) {
+  if (!Array.isArray(list)) {
+    return [];
+  }
+
+  const result = [];
+  const seenIds = new Set();
+  for (const entry of list) {
+    const normalized = normalizeSavedHighlightView(entry);
+    if (seenIds.has(normalized.id)) {
+      continue;
+    }
+    seenIds.add(normalized.id);
+    result.push(normalized);
+  }
+
+  return result.slice(0, 40);
+}
+
+function parseSmartFilterFromLegacyQuery(rawQuery) {
+  const query = normalizeText(rawQuery);
+  if (!query) {
+    return null;
+  }
+
+  if (query.startsWith('smart:')) {
+    try {
+      const parsed = JSON.parse(query.slice(6));
+      if (parsed && typeof parsed === 'object') {
+        return normalizeSmartHighlightFilter(parsed);
+      }
+    } catch {
+      // fallback to plain text query
+    }
+  }
+
+  return normalizeSmartHighlightFilter({
+    search: query,
+  });
+}
+
+function migrateViewsFromSavedQueries(list) {
+  if (!Array.isArray(list)) {
+    return [];
+  }
+
+  const result = [];
+  const seenIds = new Set();
+  for (const entry of list) {
+    const normalized = normalizeSavedHighlightQuery(entry);
+    if (!normalized.query || seenIds.has(normalized.id)) {
+      continue;
+    }
+
+    const filter = parseSmartFilterFromLegacyQuery(normalized.query);
+    if (!filter) {
+      continue;
+    }
+
+    seenIds.add(normalized.id);
+    result.push(
+      normalizeSavedHighlightView({
+        id: normalized.id,
+        name: normalized.name,
+        createdAt: normalized.createdAt,
+        updatedAt: normalized.createdAt,
+        filter,
+      }),
+    );
+  }
+
+  return result.slice(0, 40);
+}
+
+function convertViewsToSavedQueries(views) {
+  return normalizeSavedHighlightQueries(
+    views.map((view) => ({
+      id: view.id,
+      name: view.name,
+      query: `smart:${JSON.stringify(view.filter)}`,
+      createdAt: view.createdAt,
+    })),
+  );
+}
+
 function normalizeSavedHighlightQuery(item) {
   return {
     id: String(item?.id || crypto.randomUUID()),
@@ -304,7 +459,8 @@ function normalizeSavedHighlightQueries(list) {
 }
 
 function normalizeSettings(settings) {
-  const nextTheme = ALLOWED_THEMES.has(settings?.theme) ? settings.theme : DEFAULT_SETTINGS.theme;
+  const rawTheme = String(settings?.theme ?? '').trim().toLowerCase();
+  const nextTheme = ALLOWED_THEMES.has(rawTheme) ? rawTheme : 'white';
   const pagesPerDay = Math.max(
     1,
     normalizePositiveInt(settings?.goals?.pagesPerDay, DEFAULT_SETTINGS.goals.pagesPerDay),
@@ -313,8 +469,17 @@ function normalizeSettings(settings) {
     pagesPerDay,
     normalizePositiveInt(settings?.goals?.pagesPerWeek, DEFAULT_SETTINGS.goals.pagesPerWeek),
   );
-  const manifestFromEnv = normalizeHttpUrl(process.env.RECALL_UPDATE_MANIFEST_URL);
-  const manifestUrl = normalizeHttpUrl(settings?.updates?.manifestUrl) || manifestFromEnv;
+  const normalizedViews = normalizeSavedHighlightViews(settings?.savedHighlightViews);
+  const migratedViews =
+    normalizedViews.length > 0
+      ? normalizedViews
+      : migrateViewsFromSavedQueries(settings?.savedHighlightQueries);
+  const savedHighlightViews = migratedViews.slice(0, 40);
+  const savedHighlightQueries =
+    normalizeSavedHighlightQueries(settings?.savedHighlightQueries).length > 0 &&
+    normalizedViews.length === 0
+      ? normalizeSavedHighlightQueries(settings?.savedHighlightQueries)
+      : convertViewsToSavedQueries(savedHighlightViews);
 
   return {
     theme: nextTheme,
@@ -323,14 +488,8 @@ function normalizeSettings(settings) {
       pagesPerDay,
       pagesPerWeek,
     },
-    updates: {
-      manifestUrl,
-      autoCheck:
-        typeof settings?.updates?.autoCheck === 'boolean'
-          ? settings.updates.autoCheck
-          : DEFAULT_SETTINGS.updates.autoCheck,
-    },
-    savedHighlightQueries: normalizeSavedHighlightQueries(settings?.savedHighlightQueries),
+    savedHighlightViews,
+    savedHighlightQueries,
   };
 }
 
@@ -443,7 +602,7 @@ async function loadDB(storagePaths) {
       settings: {
         ...DEFAULT_SETTINGS,
         goals: { ...DEFAULT_SETTINGS.goals },
-        updates: { ...DEFAULT_SETTINGS.updates },
+        savedHighlightViews: [...DEFAULT_SETTINGS.savedHighlightViews],
         savedHighlightQueries: [...DEFAULT_SETTINGS.savedHighlightQueries],
       },
     };
@@ -484,8 +643,12 @@ function sortDocumentsForLibrary(documents) {
       return a.isPinned ? -1 : 1;
     }
 
-    const aLast = new Date(a.lastOpenedAt || a.createdAt).valueOf();
-    const bLast = new Date(b.lastOpenedAt || b.createdAt).valueOf();
+    const aCreatedAt = new Date(a.createdAt).valueOf();
+    const bCreatedAt = new Date(b.createdAt).valueOf();
+    const aLastOpenedAt = a.lastOpenedAt ? new Date(a.lastOpenedAt).valueOf() : 0;
+    const bLastOpenedAt = b.lastOpenedAt ? new Date(b.lastOpenedAt).valueOf() : 0;
+    const aLast = Math.max(aCreatedAt, aLastOpenedAt);
+    const bLast = Math.max(bCreatedAt, bLastOpenedAt);
     return bLast - aLast;
   });
 }
@@ -996,10 +1159,6 @@ async function updateSettings(storagePaths, patch = {}) {
     goals: {
       ...(db.settings?.goals || {}),
       ...(patch?.goals || {}),
-    },
-    updates: {
-      ...(db.settings?.updates || {}),
-      ...(patch?.updates || {}),
     },
   });
   await saveDB(storagePaths, db);
