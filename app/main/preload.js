@@ -26,6 +26,8 @@ function createRecallApi(ipcRenderer) {
     importPdfPaths: (paths) => ipcRenderer.invoke(IPC_CHANNELS.LIBRARY_IMPORT_PDF_PATHS, { paths }),
     updateDocumentMeta: (payload) => ipcRenderer.invoke(IPC_CHANNELS.LIBRARY_UPDATE_DOCUMENT_META, payload),
     deleteDocument: (documentId) => ipcRenderer.invoke(IPC_CHANNELS.LIBRARY_DELETE_DOCUMENT, documentId),
+    restoreDocumentFromBackup: (documentId) =>
+      ipcRenderer.invoke(IPC_CHANNELS.LIBRARY_RESTORE_DOCUMENT_FROM_BACKUP, { documentId }),
     resetDocumentReadingState: (documentId) =>
       ipcRenderer.invoke(IPC_CHANNELS.LIBRARY_RESET_READING_STATE, { documentId }),
 

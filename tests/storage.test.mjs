@@ -36,6 +36,7 @@ const {
   getReadingOverview,
   getStoragePaths,
   deleteDocument,
+  restoreDocumentFromBackup,
 } = storageModule;
 
 function makeHighlight(documentId, patch = {}) {
@@ -87,14 +88,17 @@ describe('storage module', () => {
     const updated = await updateSettings(storagePaths, {
       // old and forbidden values must always normalize to white
       theme: 'dark',
+      apryseLicenseKey: '  apryse-live-key  ',
       goals: { pagesPerDay: 7, pagesPerWeek: 20 },
     });
     expect(updated.theme).toBe('white');
+    expect(updated.apryseLicenseKey).toBe('apryse-live-key');
     expect(updated.goals.pagesPerDay).toBe(7);
     expect(updated.goals.pagesPerWeek).toBe(20);
 
     const fromGet = await getSettings(storagePaths);
     expect(fromGet.theme).toBe('white');
+    expect(fromGet.apryseLicenseKey).toBe('apryse-live-key');
   });
 
   it('recovers from corrupted db.json and keeps backup', async () => {
@@ -205,6 +209,8 @@ describe('storage module', () => {
         createdAt: '2026-02-19T09:00:00.000Z',
       }),
     );
+    expect(first.documentTitle).toBe(document.title);
+    expect(second.documentTitle).toBe(document.title);
 
     const byDocument = await listHighlights(storagePaths, document.id);
     expect(byDocument.map((item) => item.id)).toEqual([second.id, first.id]);
@@ -245,7 +251,7 @@ describe('storage module', () => {
     expect(noOpDelete.deleted).toBe(false);
   });
 
-  it('handles collections, bookmarks and cascading deleteDocument', async () => {
+  it('handles collections, bookmarks and keeps highlights after deleteDocument', async () => {
     const source = path.join(tempRoot, 'Cascade Book.pdf');
     await fs.writeFile(source, 'pdf-cascade');
     const { document } = await importDocumentFromPath(storagePaths, source);
@@ -297,17 +303,45 @@ describe('storage module', () => {
 
     const deleted = await deleteDocument(storagePaths, document.id);
     expect(deleted.deleted).toBe(true);
-    expect(deleted.removedHighlightsCount).toBe(1);
-    expect(deleted.removedBookmarksCount).toBe(1);
+    expect(deleted.removedHighlightsCount).toBe(0);
+    expect(deleted.removedBookmarksCount).toBe(0);
+    expect(deleted.detachedHighlightsCount).toBe(1);
+    expect(deleted.detachedBookmarksCount).toBe(1);
+
+    await expect(fs.access(document.filePath)).rejects.toThrow();
 
     const docAfterDelete = await getDocumentById(storagePaths, document.id);
     expect(docAfterDelete).toBeNull();
 
     const highlightsAfterDelete = await listHighlights(storagePaths, document.id);
-    expect(highlightsAfterDelete).toHaveLength(0);
+    expect(highlightsAfterDelete).toHaveLength(1);
 
     const bookmarksAfterDelete = await listBookmarks(storagePaths, document.id);
-    expect(bookmarksAfterDelete).toHaveLength(0);
+    expect(bookmarksAfterDelete).toHaveLength(1);
+
+    await deleteHighlightsByIds(
+      storagePaths,
+      highlightsAfterDelete.map((item) => item.id),
+    );
+    await deleteBookmarksByIds(
+      storagePaths,
+      bookmarksAfterDelete.map((item) => item.id),
+    );
+    expect(await listHighlights(storagePaths, document.id)).toHaveLength(0);
+    expect(await listBookmarks(storagePaths, document.id)).toHaveLength(0);
+
+    const restored = await restoreDocumentFromBackup(storagePaths, document.id);
+    expect(restored.restored).toBe(true);
+    expect(restored.documentId).toBe(document.id);
+    expect(restored.document?.id).toBe(document.id);
+    expect(restored.restoredHighlightsCount).toBe(1);
+    expect(restored.restoredBookmarksCount).toBe(1);
+    await expect(fs.access(restored.document.filePath)).resolves.toBeUndefined();
+
+    const restoredDoc = await getDocumentById(storagePaths, document.id);
+    expect(restoredDoc).not.toBeNull();
+    expect(restoredDoc.highlightsCount).toBe(1);
+    expect(restoredDoc.bookmarksCount).toBe(1);
   });
 
   it('updates collection names, reading overview and exposed paths', async () => {

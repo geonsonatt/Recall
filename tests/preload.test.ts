@@ -26,6 +26,11 @@ describe('preload bridge', () => {
     await bridgeApi.deleteDocument('doc-1');
     expect(invoke).toHaveBeenLastCalledWith('library:delete-document', 'doc-1');
 
+    await bridgeApi.restoreDocumentFromBackup('doc-1');
+    expect(invoke).toHaveBeenLastCalledWith('library:restore-document-from-backup', {
+      documentId: 'doc-1',
+    });
+
     await bridgeApi.resetDocumentReadingState('doc-1');
     expect(invoke).toHaveBeenLastCalledWith('library:reset-reading-state', { documentId: 'doc-1' });
 

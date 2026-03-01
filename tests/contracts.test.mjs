@@ -66,6 +66,16 @@ describe('shared contracts', () => {
     });
     expect(Object.prototype.hasOwnProperty.call(documentMetaPatch, 'collectionId')).toBe(false);
 
+    const restoreDocumentPayload = validateChannelPayload(
+      IPC_CHANNELS.LIBRARY_RESTORE_DOCUMENT_FROM_BACKUP,
+      {
+        documentId: 'doc-restore-1',
+      },
+    );
+    expect(restoreDocumentPayload).toEqual({
+      documentId: 'doc-restore-1',
+    });
+
     const bookmarkPatch = validateChannelPayload(IPC_CHANNELS.BOOKMARK_UPDATE, {
       id: 'bm-1',
       pageIndex: 4,
@@ -166,6 +176,12 @@ describe('shared contracts', () => {
         id: '',
       }),
     ).toThrow('[E_CONTRACT_HIGHLIGHT_UPDATE]');
+
+    expect(() =>
+      validateChannelPayload(IPC_CHANNELS.LIBRARY_RESTORE_DOCUMENT_FROM_BACKUP, {
+        documentId: '',
+      }),
+    ).toThrow('[E_CONTRACT_RESTORE_DOCUMENT]');
 
     expect(() =>
       validateChannelPayload(IPC_CHANNELS.DOCUMENT_UPDATE_READING_STATE, {

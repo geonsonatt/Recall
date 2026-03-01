@@ -33,6 +33,7 @@ const {
   updateSettings,
   getReadingOverview,
   deleteDocument,
+  restoreDocumentFromBackup,
 } = require('../data/storage');
 const { buildAnnotatedPdf } = require('../export/annotatedPdf');
 const { buildHighlightsMarkdown } = require('../export/markdown');
@@ -722,6 +723,14 @@ function registerIpc() {
     return deleteDocument(storagePaths, id);
   });
 
+  registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_RESTORE_DOCUMENT_FROM_BACKUP, async (_event, payload) => {
+    const validated = validateChannelPayload(
+      IPC_CHANNELS.LIBRARY_RESTORE_DOCUMENT_FROM_BACKUP,
+      payload,
+    );
+    return restoreDocumentFromBackup(storagePaths, validated.documentId);
+  });
+
   registerTrustedIpcHandle(IPC_CHANNELS.LIBRARY_RESET_READING_STATE, async (_event, payload) => {
     const validated = validateChannelPayload(IPC_CHANNELS.LIBRARY_RESET_READING_STATE, payload);
     return resetDocumentReadingState(storagePaths, validated.documentId);
@@ -745,13 +754,40 @@ function registerIpc() {
   });
 
   registerTrustedIpcHandle(IPC_CHANNELS.DOCUMENT_READ_PDF_BYTES, async (_event, documentId) => {
-    const document = await getDocumentById(storagePaths, String(documentId));
+    const id = String(documentId ?? '');
+    const document = await getDocumentById(storagePaths, id);
 
     if (!document) {
       throw new Error('Документ не найден.');
     }
 
-    return fs.readFile(document.filePath);
+    try {
+      return await fs.readFile(document.filePath);
+    } catch (error) {
+      const errorCode = String(error?.code ?? '').toUpperCase();
+      const canRestoreFromBackup =
+        errorCode === 'ENOENT' ||
+        errorCode === 'ENOTDIR' ||
+        errorCode === 'EACCES' ||
+        errorCode === 'EPERM';
+
+      if (!canRestoreFromBackup) {
+        throw error;
+      }
+
+      const restored = await restoreDocumentFromBackup(storagePaths, id, {
+        restoreAnnotations: false,
+      });
+      if (!restored?.restored || !restored?.document?.filePath) {
+        throw new Error('PDF-файл книги отсутствует, восстановление из бэкапа не удалось.');
+      }
+
+      try {
+        return await fs.readFile(restored.document.filePath);
+      } catch {
+        throw new Error('PDF-файл книги отсутствует даже после восстановления из бэкапа.');
+      }
+    }
   });
 
   registerTrustedIpcHandle(IPC_CHANNELS.HIGHLIGHT_LIST, async (_event, payload) => {
@@ -787,6 +823,7 @@ function registerIpc() {
     const highlight = {
       id: crypto.randomUUID(),
       documentId,
+      documentTitle: document.title,
       pageIndex: payload.pageIndex,
       rects: payload.rects,
       selectedText: payload.selectedText,

@@ -40,6 +40,19 @@ declare global {
         deleted: boolean;
         documentId?: string;
         removedHighlightsCount?: number;
+        removedBookmarksCount?: number;
+        detachedHighlightsCount?: number;
+        detachedBookmarksCount?: number;
+      }>;
+      restoreDocumentFromBackup: (documentId: string) => Promise<{
+        restored: boolean;
+        documentId: string;
+        document?: DocumentRecord | null;
+        restoredFile?: boolean;
+        restoredHighlightsCount?: number;
+        restoredBookmarksCount?: number;
+        backupPath?: string;
+        reason?: string;
       }>;
       resetDocumentReadingState: (documentId: string) => Promise<DocumentRecord>;
 

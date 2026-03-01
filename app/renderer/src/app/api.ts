@@ -230,6 +230,10 @@ export async function deleteDocument(documentId: string) {
   return invokeRecallApi('deleteDocument', [documentId], { documentId });
 }
 
+export async function restoreDocumentFromBackup(documentId: string) {
+  return invokeRecallApi('restoreDocumentFromBackup', [documentId], { documentId });
+}
+
 export async function getDocument(documentId: string) {
   return invokeRecallApi('getDocument', [documentId], { documentId });
 }

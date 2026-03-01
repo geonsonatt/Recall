@@ -197,8 +197,10 @@ export function HighlightsView({
           return left.pageIndex - right.pageIndex;
         }
 
-        const leftTitle = documentMap.get(left.documentId)?.title || left.documentId;
-        const rightTitle = documentMap.get(right.documentId)?.title || right.documentId;
+        const leftTitle =
+          documentMap.get(left.documentId)?.title || String(left.documentTitle || left.documentId);
+        const rightTitle =
+          documentMap.get(right.documentId)?.title || String(right.documentTitle || right.documentId);
         return leftTitle.localeCompare(rightTitle, 'ru');
       });
   }, [
@@ -264,7 +266,9 @@ export function HighlightsView({
     }
     return [...map.entries()].map(([groupId, sectionHighlights]) => ({
       groupId,
-      title: documentMap.get(groupId)?.title || groupId,
+      title:
+        documentMap.get(groupId)?.title ||
+        String(sectionHighlights[0]?.documentTitle || groupId),
       highlights: sectionHighlights,
     }));
   }, [documentMap, filteredHighlights, groupMode]);
@@ -412,7 +416,8 @@ export function HighlightsView({
   }, [filteredHighlights, highlights, selectedHighlightId]);
 
   const selectedHighlightTitle = selectedHighlight
-    ? documentMap.get(selectedHighlight.documentId)?.title || selectedHighlight.documentId
+    ? documentMap.get(selectedHighlight.documentId)?.title ||
+      String(selectedHighlight.documentTitle || selectedHighlight.documentId)
     : '';
 
   const selectedHighlightsForBulk = useMemo(() => {
@@ -454,7 +459,9 @@ export function HighlightsView({
 
     const text = highlightsToCopy
       .map((highlight) => {
-        const title = documentMap.get(highlight.documentId)?.title || highlight.documentId;
+        const title =
+          documentMap.get(highlight.documentId)?.title ||
+          String(highlight.documentTitle || highlight.documentId);
         const note = String(highlight.note || '').trim();
         const noteLine = note ? `\nЗаметка: ${note}` : '';
         return `[${title}] стр. ${highlight.pageIndex + 1}\n${highlight.selectedText}${noteLine}`;

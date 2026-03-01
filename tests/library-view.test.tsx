@@ -48,6 +48,7 @@ describe('LibraryView', () => {
     const onAssignCollection = vi.fn().mockResolvedValue(undefined);
     const onCreateCollection = vi.fn().mockResolvedValue(undefined);
     const onSaveFocusMode = vi.fn().mockResolvedValue(undefined);
+    const onSaveApryseLicenseKey = vi.fn().mockResolvedValue(undefined);
     const onRevealDataFolder = vi.fn().mockResolvedValue(undefined);
     const onBackup = vi.fn().mockResolvedValue(undefined);
     const onRestore = vi.fn().mockResolvedValue(undefined);
@@ -74,6 +75,7 @@ describe('LibraryView', () => {
         onAssignCollection={onAssignCollection}
         onCreateCollection={onCreateCollection}
         onSaveFocusMode={onSaveFocusMode}
+        onSaveApryseLicenseKey={onSaveApryseLicenseKey}
         onRevealDataFolder={onRevealDataFolder}
         onBackup={onBackup}
         onRestore={onRestore}
@@ -108,6 +110,12 @@ describe('LibraryView', () => {
 
     fireEvent.click(screen.getByTitle('Закрепить книгу'));
     expect(onTogglePin).toHaveBeenCalledWith(document);
+
+    fireEvent.change(screen.getByLabelText('Лицензия Apryse'), {
+      target: { value: 'apr-key-123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить ключ' }));
+    expect(onSaveApryseLicenseKey).toHaveBeenCalledWith('apr-key-123');
 
     const dropZone = screen.getByText('Библиотека книг').closest('.library-table');
     fireEvent.drop(dropZone!, {
@@ -163,6 +171,7 @@ describe('LibraryView', () => {
         onAssignCollection={vi.fn().mockResolvedValue(undefined)}
         onCreateCollection={vi.fn().mockResolvedValue(undefined)}
         onSaveFocusMode={vi.fn().mockResolvedValue(undefined)}
+        onSaveApryseLicenseKey={vi.fn().mockResolvedValue(undefined)}
         onRevealDataFolder={vi.fn().mockResolvedValue(undefined)}
         onBackup={vi.fn().mockResolvedValue(undefined)}
         onRestore={vi.fn().mockResolvedValue(undefined)}

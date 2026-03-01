@@ -27,6 +27,7 @@ interface LibraryViewProps {
   onAssignCollection: (documentId: string, collectionId?: string) => Promise<void>;
   onCreateCollection: (name: string) => Promise<void>;
   onSaveFocusMode: (focusMode: boolean) => Promise<void>;
+  onSaveApryseLicenseKey: (licenseKey?: string) => Promise<void>;
   onRevealDataFolder: () => Promise<void>;
   onBackup: () => Promise<void>;
   onRestore: () => Promise<void>;
@@ -53,6 +54,7 @@ export function LibraryView({
   onAssignCollection,
   onCreateCollection,
   onSaveFocusMode,
+  onSaveApryseLicenseKey,
   onRevealDataFolder,
   onBackup,
   onRestore,
@@ -73,6 +75,13 @@ export function LibraryView({
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(340);
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
+  const [apryseLicenseKeyDraft, setApryseLicenseKeyDraft] = useState(
+    String(settings.apryseLicenseKey || ''),
+  );
+
+  useEffect(() => {
+    setApryseLicenseKeyDraft(String(settings.apryseLicenseKey || ''));
+  }, [settings.apryseLicenseKey]);
 
   useEffect(() => {
     try {
@@ -266,6 +275,9 @@ export function LibraryView({
     () => (selectedDocument ? getDocumentProgress(selectedDocument) : null),
     [selectedDocument],
   );
+  const normalizedLicenseDraft = apryseLicenseKeyDraft.trim();
+  const normalizedSavedLicense = String(settings.apryseLicenseKey || '').trim();
+  const hasLicenseDraftChanges = normalizedLicenseDraft !== normalizedSavedLicense;
 
   const collectionNameById = useMemo(() => {
     const map = new Map<string, string>();
@@ -719,6 +731,41 @@ export function LibraryView({
                 />
                 <span>Фокус-режим читалки</span>
               </label>
+              <label>
+                Лицензия Apryse
+                <input
+                  type="text"
+                  value={apryseLicenseKeyDraft}
+                  placeholder="Вставьте ключ Apryse WebViewer"
+                  onChange={(event) => {
+                    setApryseLicenseKeyDraft(event.target.value);
+                  }}
+                />
+              </label>
+              <p className="muted">Нужна после окончания trial в PDF-движке.</p>
+              <div className="action-row compact">
+                <button
+                  type="button"
+                  className="btn secondary"
+                  disabled={!hasLicenseDraftChanges}
+                  onClick={() => {
+                    void onSaveApryseLicenseKey(normalizedLicenseDraft || undefined);
+                  }}
+                >
+                  Сохранить ключ
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={!normalizedSavedLicense && !normalizedLicenseDraft}
+                  onClick={() => {
+                    setApryseLicenseKeyDraft('');
+                    void onSaveApryseLicenseKey(undefined);
+                  }}
+                >
+                  Очистить
+                </button>
+              </div>
             </LiquidSurface>
             <LiquidSurface className="glass-panel library-config-card library-config-item">
               <h2>Коллекции</h2>

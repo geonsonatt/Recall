@@ -7,6 +7,7 @@ import {
   createCollection,
   deleteHighlight as deleteHighlightById,
   deleteDocument,
+  restoreDocumentFromBackup,
   exportAnnotatedPdf,
   exportMarkdown,
   exportNotionBundle,
@@ -197,6 +198,72 @@ function sortSavedHighlightViews(views: SavedHighlightView[]): SavedHighlightVie
   });
 }
 
+function toSafePageIndex(value: unknown): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(raw));
+}
+
+function toSafeTotalPages(value: unknown): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(raw));
+}
+
+function toIsoMs(value: unknown): number {
+  const date = new Date(String(value || ''));
+  const ts = date.valueOf();
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function mergeDocumentReadingState(
+  previous: DocumentRecord,
+  incoming: DocumentRecord,
+): DocumentRecord {
+  const previousTotalPages = toSafeTotalPages(previous.lastReadTotalPages);
+  const incomingTotalPages = toSafeTotalPages(incoming.lastReadTotalPages);
+  const mergedTotalPages = Math.max(previousTotalPages, incomingTotalPages);
+  const maxPageCap = Math.max(0, mergedTotalPages - 1);
+
+  const previousLastReadPageIndex = Math.min(toSafePageIndex(previous.lastReadPageIndex), maxPageCap);
+  const incomingLastReadPageIndex = Math.min(toSafePageIndex(incoming.lastReadPageIndex), maxPageCap);
+  const previousMaxReadPageIndex = Math.min(
+    Math.max(toSafePageIndex(previous.maxReadPageIndex), previousLastReadPageIndex),
+    maxPageCap,
+  );
+  const incomingMaxReadPageIndex = Math.min(
+    Math.max(toSafePageIndex(incoming.maxReadPageIndex), incomingLastReadPageIndex),
+    maxPageCap,
+  );
+  const mergedMaxReadPageIndex = Math.max(previousMaxReadPageIndex, incomingMaxReadPageIndex);
+
+  const previousOpenedAtMs = toIsoMs(previous.lastOpenedAt);
+  const incomingOpenedAtMs = toIsoMs(incoming.lastOpenedAt);
+  const usePreviousLastRead = previousOpenedAtMs > incomingOpenedAtMs;
+  const mergedLastReadPageIndex = usePreviousLastRead
+    ? previousLastReadPageIndex
+    : incomingLastReadPageIndex;
+  const mergedLastOpenedAt = usePreviousLastRead
+    ? previous.lastOpenedAt
+    : incoming.lastOpenedAt || previous.lastOpenedAt;
+
+  return {
+    ...incoming,
+    lastReadPageIndex: mergedLastReadPageIndex,
+    maxReadPageIndex: mergedMaxReadPageIndex,
+    lastReadTotalPages: mergedTotalPages || undefined,
+    lastOpenedAt: mergedLastOpenedAt,
+    totalReadingSeconds: Math.max(
+      toSafePageIndex(previous.totalReadingSeconds),
+      toSafePageIndex(incoming.totalReadingSeconds),
+    ),
+  };
+}
+
 export default function App() {
   useBootstrap();
   const [uiDensity, setUiDensity] = useState<'comfortable' | 'compact'>('comfortable');
@@ -259,16 +326,9 @@ export default function App() {
   );
 
   const canOpenReader = Boolean(activeDocument);
-  const canOpenHighlights = documents.length > 0;
+  const canOpenHighlights = documents.length > 0 || allHighlights.length > 0;
   const canOpenInsights = documents.length > 0;
-  const totalHighlights = useMemo(
-    () =>
-      documents.reduce(
-        (sum, documentInfo) => sum + Math.max(0, Number(documentInfo.highlightsCount || 0)),
-        0,
-      ),
-    [documents],
-  );
+  const totalHighlights = allHighlights.length;
 
   const savedHighlightViews = useMemo(() => {
     const explicitViews = Array.isArray(settings.savedHighlightViews)
@@ -319,7 +379,9 @@ export default function App() {
 
     const tagSeen = new Set<string>();
     for (const highlight of allHighlights) {
-      const documentTitle = documentMap.get(highlight.documentId)?.title || highlight.documentId;
+      const documentTitle =
+        documentMap.get(highlight.documentId)?.title ||
+        String(highlight.documentTitle || highlight.documentId);
       items.push({
         id: `highlight:${highlight.id}`,
         kind: 'highlight',
@@ -424,7 +486,9 @@ export default function App() {
       if (!pendingDeepLinkRef.current) {
         return;
       }
-      if (documents.length === 0 && pendingDeepLinkRef.current.view !== 'library') {
+      const deepLinkView = pendingDeepLinkRef.current.view;
+      const canApplyWithoutDocuments = deepLinkView === 'library' || deepLinkView === 'highlights';
+      if (documents.length === 0 && !canApplyWithoutDocuments) {
         return;
       }
       if (applyDeepLinkPayload(pendingDeepLinkRef.current)) {
@@ -456,7 +520,8 @@ export default function App() {
       }
       pendingDeepLinkRef.current = payload;
 
-      const canApply = documents.length > 0 || payload.view === 'library';
+      const canApply =
+        documents.length > 0 || payload.view === 'library' || payload.view === 'highlights';
       if (canApply && applyDeepLinkPayload(payload)) {
         didApplyInitialDeepLinkRef.current = true;
         pendingDeepLinkRef.current = null;
@@ -479,7 +544,9 @@ export default function App() {
     if (!pendingDeepLinkRef.current) {
       return;
     }
-    if (documents.length === 0 && pendingDeepLinkRef.current.view !== 'library') {
+    const deepLinkView = pendingDeepLinkRef.current.view;
+    const canApplyWithoutDocuments = deepLinkView === 'library' || deepLinkView === 'highlights';
+    if (documents.length === 0 && !canApplyWithoutDocuments) {
       return;
     }
     if (applyDeepLinkPayload(pendingDeepLinkRef.current)) {
@@ -537,12 +604,24 @@ export default function App() {
         listCollections(),
         listAllHighlights(),
       ]);
+      const existingDocumentsById = new Map(
+        useAppStore
+          .getState()
+          .documents.map((documentInfo) => [documentInfo.id, documentInfo]),
+      );
+      const mergedDocuments = nextDocuments.map((documentInfo) => {
+        const existing = existingDocumentsById.get(documentInfo.id);
+        if (!existing) {
+          return documentInfo;
+        }
+        return mergeDocumentReadingState(existing, documentInfo);
+      });
 
-      setDocuments(nextDocuments);
+      setDocuments(mergedDocuments);
       setCollections(nextCollections);
       setAllHighlights(nextHighlights);
       refreshAction.finish(true, {
-        details: `docs=${nextDocuments.length} collections=${nextCollections.length} highlights=${nextHighlights.length}`,
+        details: `docs=${mergedDocuments.length} collections=${nextCollections.length} highlights=${nextHighlights.length}`,
       });
     } catch (refreshError) {
       refreshAction.finish(false, {
@@ -611,17 +690,54 @@ export default function App() {
       highlightId,
       details: Number.isFinite(Number(pageIndex)) ? `page=${Number(pageIndex) + 1}` : undefined,
     });
-    setActiveDocumentId(documentId);
-    if (Number.isFinite(Number(pageIndex))) {
-      setPendingNavigation({
-        documentId,
-        pageIndex: Math.max(0, Math.trunc(Number(pageIndex))),
-        highlightId,
-      });
-    } else {
-      setPendingNavigation(null);
+
+    const applyReaderState = () => {
+      setActiveDocumentId(documentId);
+      if (Number.isFinite(Number(pageIndex))) {
+        setPendingNavigation({
+          documentId,
+          pageIndex: Math.max(0, Math.trunc(Number(pageIndex))),
+          highlightId,
+        });
+      } else {
+        setPendingNavigation(null);
+      }
+      setView('reader');
+    };
+
+    const targetDocument = documents.find((documentInfo) => documentInfo.id === documentId);
+    if (targetDocument) {
+      applyReaderState();
+      return;
     }
-    setView('reader');
+
+    void (async () => {
+      try {
+        const restored = await restoreDocumentFromBackup(documentId);
+        if (restored?.restored && restored?.document) {
+          upsertDocument(restored.document);
+          await refreshLibraryData();
+          showToast('Книга восстановлена из локального бэкапа.', 'success');
+          applyReaderState();
+          return;
+        }
+      } catch (error: any) {
+        showToast(
+          formatErrorToast(
+            'Не удалось восстановить книгу из бэкапа',
+            error,
+            'E_RESTORE_DOCUMENT',
+          ),
+          'error',
+        );
+      }
+
+      showToast(
+        'Книга недоступна в библиотеке. Хайлайт сохранён и остаётся во вкладке «Хайлайты».',
+        'info',
+      );
+      setView('highlights');
+    })();
   }
 
   function openHighlights(documentId?: string) {
@@ -883,7 +999,9 @@ export default function App() {
       documentId,
       details: title,
     });
-    const confirmed = window.confirm(`Удалить книгу "${title}" и все её хайлайты?`);
+    const confirmed = window.confirm(
+      `Удалить книгу "${title}" из библиотеки? Хайлайты и закладки останутся.`,
+    );
     if (!confirmed) {
       incrementDebugCounter('app.delete-document.canceled', 1, 'app', {
         documentId,
@@ -1142,6 +1260,28 @@ export default function App() {
     }
   }
 
+  async function handleSaveApryseLicenseKey(licenseKey?: string) {
+    const normalizedLicenseKey = String(licenseKey || '').trim() || undefined;
+    addDebugEvent('app', 'ui.apryse-license.save', {
+      details: normalizedLicenseKey ? 'set' : 'cleared',
+    });
+    try {
+      const updated = await updateSettings({ apryseLicenseKey: normalizedLicenseKey });
+      patchSettings(updated);
+      showToast(
+        normalizedLicenseKey
+          ? 'Ключ Apryse сохранён. Откройте книгу повторно.'
+          : 'Ключ Apryse очищен.',
+        'success',
+      );
+    } catch (error: any) {
+      showToast(
+        formatErrorToast('Ошибка сохранения ключа Apryse', error, 'E_SETTINGS_APRYSE'),
+        'error',
+      );
+    }
+  }
+
   async function handleRevealDataFolder() {
     try {
       await revealUserData();
@@ -1200,6 +1340,34 @@ export default function App() {
     } catch (error: any) {
       showToast(formatErrorToast('Ошибка сброса прогресса', error, 'E_RESET_PROGRESS'), 'error');
     }
+  }
+
+  function handleReaderPageStateChange(pageIndex: number, totalPages: number) {
+    const safePageIndex = toSafePageIndex(pageIndex);
+    const safeTotalPages = Math.max(1, toSafeTotalPages(totalPages));
+    setCurrentPageState(safePageIndex, safeTotalPages);
+
+    const state = useAppStore.getState();
+    const activeId = state.activeDocumentId;
+    if (!activeId) {
+      return;
+    }
+    const existing = state.documents.find((documentInfo) => documentInfo.id === activeId);
+    if (!existing) {
+      return;
+    }
+
+    const optimisticDocument = mergeDocumentReadingState(existing, {
+      ...existing,
+      lastReadPageIndex: safePageIndex,
+      maxReadPageIndex: safePageIndex,
+      lastReadTotalPages: Math.max(
+        toSafeTotalPages(existing.lastReadTotalPages),
+        safeTotalPages,
+      ),
+      lastOpenedAt: new Date().toISOString(),
+    });
+    upsertDocument(optimisticDocument);
   }
 
   async function handleDeleteHighlight(highlight: HighlightRecord) {
@@ -1283,11 +1451,14 @@ export default function App() {
       return;
     }
 
-    if (nextView === 'highlights' || nextView === 'insights') {
-      if (documents.length === 0) {
-        showToast('Сначала импортируйте книгу.', 'info');
-        return;
-      }
+    if (nextView === 'highlights' && !canOpenHighlights) {
+      showToast('Сначала импортируйте книгу или создайте хотя бы один хайлайт.', 'info');
+      return;
+    }
+
+    if (nextView === 'insights' && !canOpenInsights) {
+      showToast('Сначала импортируйте книгу.', 'info');
+      return;
     }
 
     setView(nextView);
@@ -1867,6 +2038,7 @@ export default function App() {
           onAssignCollection={handleAssignCollection}
           onCreateCollection={handleCreateCollection}
           onSaveFocusMode={handleSaveFocusMode}
+          onSaveApryseLicenseKey={handleSaveApryseLicenseKey}
           onRevealDataFolder={handleRevealDataFolder}
           onBackup={handleBackup}
           onRestore={handleRestore}
@@ -1902,7 +2074,7 @@ export default function App() {
           onDeleteHighlightFromStore={(documentId, highlightId) => {
             removeDocumentHighlight(documentId, highlightId);
           }}
-          onSetCurrentPage={(pageIndex, totalPages) => setCurrentPageState(pageIndex, totalPages)}
+          onSetCurrentPage={handleReaderPageStateChange}
           onNotify={showToast}
           onCopyDeepLink={(documentId, pageIndex, highlightId) => {
             void copyDeepLink({

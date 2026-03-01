@@ -4,6 +4,7 @@ const IPC_CHANNELS = {
   LIBRARY_IMPORT_PDF_PATHS: 'library:import-pdf-paths',
   LIBRARY_UPDATE_DOCUMENT_META: 'library:update-document-meta',
   LIBRARY_DELETE_DOCUMENT: 'library:delete-document',
+  LIBRARY_RESTORE_DOCUMENT_FROM_BACKUP: 'library:restore-document-from-backup',
   LIBRARY_RESET_READING_STATE: 'library:reset-reading-state',
 
   DOCUMENT_GET: 'document:get',
@@ -249,6 +250,21 @@ function validateChannelPayload(channel, payload) {
       const input = ensureObjectPayload(payload, 'E_CONTRACT_READING_RESET', 'payload reset-reading-state');
       return {
         documentId: ensureNonEmptyString(input.documentId, 'E_CONTRACT_READING_RESET', 'documentId'),
+      };
+    }
+
+    case IPC_CHANNELS.LIBRARY_RESTORE_DOCUMENT_FROM_BACKUP: {
+      const input = ensureObjectPayload(
+        payload,
+        'E_CONTRACT_RESTORE_DOCUMENT',
+        'payload restore-document-from-backup',
+      );
+      return {
+        documentId: ensureNonEmptyString(
+          input.documentId,
+          'E_CONTRACT_RESTORE_DOCUMENT',
+          'documentId',
+        ),
       };
     }
 

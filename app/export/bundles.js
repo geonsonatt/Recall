@@ -110,10 +110,11 @@ function buildHighlightsCsv(documents, highlights) {
   const rows = [header.join(',')];
   for (const highlight of sortHighlights(highlights)) {
     const document = documentMap.get(String(highlight.documentId));
+    const fallbackTitle = normalizeInlineText(highlight.documentTitle || '');
     const values = [
       highlight.id,
       highlight.documentId,
-      normalizeInlineText(document?.title || highlight.documentId),
+      normalizeInlineText(document?.title) || fallbackTitle || String(highlight.documentId),
       String(Number(highlight.pageIndex ?? 0) + 1),
       normalizeMultilineText(highlight.selectedText || ''),
       normalizeMultilineText(highlight.note || ''),

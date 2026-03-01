@@ -311,7 +311,10 @@ function generateSrsDeck(db, options = {}) {
 
   const cards = sorted.slice(0, limit).map((highlight) => {
     const document = documentMap.get(String(highlight.documentId));
-    const documentTitle = normalizeInlineText(document?.title) || String(highlight.documentId);
+    const documentTitle =
+      normalizeInlineText(document?.title) ||
+      normalizeInlineText(highlight.documentTitle || '') ||
+      String(highlight.documentId);
     const sourceText = cleanHighlightText(highlight);
     const cloze = buildCloze(sourceText);
     const note = normalizeInlineText(highlight.note || '');
@@ -490,6 +493,7 @@ function buildReadingDigest(db, options = {}) {
   for (const highlight of highlights) {
     const docTitle =
       normalizeInlineText(documentMap.get(String(highlight.documentId))?.title) ||
+      normalizeInlineText(highlight.documentTitle || '') ||
       String(highlight.documentId);
     highlightsByDocument.set(docTitle, (highlightsByDocument.get(docTitle) || 0) + 1);
 
@@ -822,7 +826,10 @@ function askLibrary(db, options = {}) {
   const citations = scored.map((item, index) => {
     const highlight = item.highlight;
     const document = documentMap.get(String(highlight.documentId));
-    const documentTitle = normalizeInlineText(document?.title) || String(highlight.documentId);
+    const documentTitle =
+      normalizeInlineText(document?.title) ||
+      normalizeInlineText(highlight.documentTitle || '') ||
+      String(highlight.documentId);
 
     return {
       index: index + 1,

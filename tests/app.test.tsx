@@ -16,6 +16,7 @@ const { apiMocks, libraryPropsSpy, readerPropsSpy, highlightsPropsSpy } = vi.hoi
     importPdf: vi.fn(),
     importPdfPaths: vi.fn(),
     deleteDocument: vi.fn(),
+    restoreDocumentFromBackup: vi.fn(),
     exportAnnotatedPdf: vi.fn(),
     exportMarkdown: vi.fn(),
     exportObsidianBundle: vi.fn(),
@@ -164,6 +165,11 @@ describe('App', () => {
     apiMocks.importPdfPaths.mockResolvedValue({ imported: [], duplicates: [], errors: [] });
     apiMocks.createCollection.mockResolvedValue({ id: 'col-1', name: 'X' });
     apiMocks.deleteDocument.mockResolvedValue({ deleted: true, documentId: 'doc-1' });
+    apiMocks.restoreDocumentFromBackup.mockResolvedValue({
+      restored: false,
+      documentId: 'doc-1',
+      reason: 'backup_not_found',
+    });
     apiMocks.deleteHighlight.mockResolvedValue({ deleted: true });
     apiMocks.exportAnnotatedPdf.mockResolvedValue({ canceled: true });
     apiMocks.exportMarkdown.mockResolvedValue({ canceled: true });
@@ -256,6 +262,18 @@ describe('App', () => {
     });
     expect(readerPropsSpy).toHaveBeenCalled();
 
+    const latestReaderProps = readerPropsSpy.mock.calls.at(-1)?.[0];
+    expect(latestReaderProps).toBeTruthy();
+    latestReaderProps.onSetCurrentPage(6, 10);
+
+    fireEvent.click(screen.getByRole('button', { name: 'tab-library' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('library-view')).toBeInTheDocument();
+    });
+    const libraryPropsAfterPageUpdate = libraryPropsSpy.mock.calls.at(-1)?.[0];
+    expect(libraryPropsAfterPageUpdate.documents[0].lastReadPageIndex).toBe(6);
+    expect(libraryPropsAfterPageUpdate.documents[0].maxReadPageIndex).toBe(6);
+
     fireEvent.click(screen.getByRole('button', { name: 'tab-highlights' }));
     await waitFor(() => {
       expect(screen.getByTestId('highlights-view')).toBeInTheDocument();
@@ -264,6 +282,7 @@ describe('App', () => {
     firstRender.unmount();
 
     // Empty bootstrap branch: no documents => guarded navigation with toast.
+    window.history.replaceState(null, '', '#/library');
     useAppStore.setState(useAppStore.getInitialState(), true);
     apiMocks.listDocuments.mockResolvedValueOnce([]);
     const secondRender = render(<App />);
@@ -276,6 +295,35 @@ describe('App', () => {
       expect(secondRender.getByTestId('toast')).toHaveTextContent(
         'Сначала откройте книгу из библиотеки.',
       );
+    });
+  });
+
+  it('allows highlights tab when there are highlights but no documents', async () => {
+    window.history.replaceState(null, '', '#/library');
+    useAppStore.setState(useAppStore.getInitialState(), true);
+    apiMocks.listDocuments.mockResolvedValueOnce([]);
+    apiMocks.listAllHighlights.mockResolvedValueOnce([
+      {
+        id: 'hl-orphan-1',
+        documentId: 'doc-orphan-1',
+        documentTitle: 'Удалённая книга',
+        pageIndex: 4,
+        rects: [{ x: 0.1, y: 0.2, w: 0.2, h: 0.03 }],
+        selectedText: 'Осиротевший хайлайт',
+        color: 'yellow',
+        createdAt: '2026-02-19T11:00:00.000Z',
+      },
+    ]);
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId('library-view')).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId('tab-cap-highlights')).toHaveTextContent('true');
+    fireEvent.click(screen.getByRole('button', { name: 'tab-highlights' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('highlights-view')).toBeInTheDocument();
     });
   });
 });

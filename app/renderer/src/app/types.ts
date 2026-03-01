@@ -31,6 +31,7 @@ export interface DocumentRecord {
 export interface HighlightRecord {
   id: string;
   documentId: string;
+  documentTitle?: string;
   pageIndex: number;
   rects: RectNorm[];
   selectedText: string;
@@ -60,6 +61,7 @@ export interface ReadingLogEntry {
 export interface AppSettings {
   theme: 'white';
   focusMode: boolean;
+  apryseLicenseKey?: string;
   goals: {
     pagesPerDay: number;
     pagesPerWeek: number;

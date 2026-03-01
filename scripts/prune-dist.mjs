@@ -16,6 +16,10 @@ async function walk(dirPath, onFile) {
   }
 }
 
+
+
+
+
 async function main() {
   const distRoot = path.resolve(process.cwd(), 'dist/renderer/webviewer');
 

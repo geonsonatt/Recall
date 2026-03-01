@@ -79,6 +79,7 @@ interface AppStoreState {
 const defaultSettings: AppSettings = {
   theme: 'white',
   focusMode: false,
+  apryseLicenseKey: undefined,
   goals: {
     pagesPerDay: 20,
     pagesPerWeek: 140,
@@ -196,17 +197,8 @@ export const useAppStore = create<AppStoreState>((set, get) => ({
       addDebugEvent('store', 'remove-document', {
         documentId,
       });
-      const nextByDocument = { ...state.highlightsByDocument };
-      delete nextByDocument[documentId];
-
-      const nextAllHighlights = state.allHighlights.filter(
-        (highlight) => highlight.documentId !== documentId,
-      );
-
       return {
         documents: state.documents.filter((item) => item.id !== documentId),
-        highlightsByDocument: nextByDocument,
-        allHighlights: nextAllHighlights,
         activeDocumentId:
           state.activeDocumentId === documentId ? null : state.activeDocumentId,
       };

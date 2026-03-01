@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 
 interface UseViewerLifecycleOptions {
   toolbarGroup: string;
+  licenseKey?: string;
 }
 
 export function useViewerLifecycle(options: UseViewerLifecycleOptions) {
@@ -28,6 +29,9 @@ export function useViewerLifecycle(options: UseViewerLifecycleOptions) {
 
       const WebViewerModule = await import('@pdftron/webviewer');
       const WebViewer = (WebViewerModule as any).default ?? WebViewerModule;
+      const runtimeLicenseKey = String(options.licenseKey || '').trim();
+      const buildLicenseKey = String(import.meta.env.VITE_APRYSE_LICENSE_KEY || '').trim();
+      const licenseKey = runtimeLicenseKey || buildLicenseKey || undefined;
 
       const instance = await WebViewer(
         {
@@ -37,7 +41,7 @@ export function useViewerLifecycle(options: UseViewerLifecycleOptions) {
           defaultLanguage: 'ru',
           enableAnnotations: true,
           notesInLeftPanel: true,
-          licenseKey: import.meta.env.VITE_APRYSE_LICENSE_KEY || undefined,
+          licenseKey,
         },
         hostRef.current,
       );
@@ -83,7 +87,7 @@ export function useViewerLifecycle(options: UseViewerLifecycleOptions) {
       instanceRef.current = null;
       setViewerReady(false);
     };
-  }, [initAttempt, options.toolbarGroup]);
+  }, [initAttempt, options.licenseKey, options.toolbarGroup]);
 
   const retryViewerInit = () => {
     const instance = instanceRef.current;

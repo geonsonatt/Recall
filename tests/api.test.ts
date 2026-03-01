@@ -8,6 +8,7 @@ function createRecallApiMock() {
     importPdfPaths: vi.fn().mockResolvedValue({ imported: [], duplicates: [], errors: [] }),
     updateDocumentMeta: vi.fn().mockResolvedValue({ id: 'doc-1' }),
     deleteDocument: vi.fn().mockResolvedValue({ deleted: true }),
+    restoreDocumentFromBackup: vi.fn().mockResolvedValue({ restored: true, documentId: 'doc-1' }),
     resetDocumentReadingState: vi.fn().mockResolvedValue({ id: 'doc-1' }),
     getDocument: vi.fn().mockResolvedValue({ id: 'doc-1' }),
     updateDocumentReadingState: vi.fn().mockResolvedValue({ id: 'doc-1' }),
@@ -69,6 +70,9 @@ describe('renderer api wrappers', () => {
 
     await rendererApi.deleteDocument('doc-1');
     expect(recallApi.deleteDocument).toHaveBeenCalledWith('doc-1');
+
+    await rendererApi.restoreDocumentFromBackup('doc-1');
+    expect(recallApi.restoreDocumentFromBackup).toHaveBeenCalledWith('doc-1');
 
     await rendererApi.getDocument('doc-1');
     expect(recallApi.getDocument).toHaveBeenCalledWith('doc-1');

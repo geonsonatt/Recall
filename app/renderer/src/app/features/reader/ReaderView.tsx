@@ -6,6 +6,7 @@ import {
   exportMarkdown,
   listHighlights,
   readDocumentPdfBytes,
+  restoreDocumentFromBackup,
   updateHighlight,
   updateReadingState,
 } from '../../api';
@@ -24,7 +25,7 @@ import {
 } from '../../lib/highlight';
 import { clamp, normalizeSelectionText, normalizeText, truncate, truncateSelectionText } from '../../lib/format';
 import { HIGHLIGHT_COLORS, highlightColorLabel } from '../../lib/highlightColors';
-import { formatErrorToast } from '../../lib/errors';
+import { formatErrorToast, toUiErrorInfo } from '../../lib/errors';
 import {
   addDebugEvent,
   incrementDebugCounter,
@@ -115,6 +116,14 @@ type BufferLike = {
   data?: number[];
 };
 
+const APRYSE_LICENSE_ERROR_PATTERNS = [
+  /thank you for evaluating webviewer/i,
+  /trial has expired/i,
+  /apryse\.com\/trial/i,
+  /apryse/i,
+  /e_reader_license/i,
+];
+
 function toArrayBuffer(bytes: ArrayBuffer | Uint8Array | BufferLike) {
   if (bytes instanceof ArrayBuffer) {
     return bytes;
@@ -130,6 +139,46 @@ function toArrayBuffer(bytes: ArrayBuffer | Uint8Array | BufferLike) {
   }
 
   throw new Error('Неподдерживаемый формат PDF-данных.');
+}
+
+function isApryseLicenseError(error: unknown) {
+  const info = toUiErrorInfo(error, 'E_READER_LOAD');
+  const unknown = error as any;
+  const haystack = [
+    info.code,
+    info.message,
+    typeof unknown?.reason === 'string' ? unknown.reason : '',
+    typeof unknown?.details === 'string' ? unknown.details : '',
+    typeof error === 'string' ? error : '',
+  ]
+    .map((item) => String(item || '').trim())
+    .join('\n');
+  if (!haystack) {
+    return false;
+  }
+
+  return APRYSE_LICENSE_ERROR_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
+function formatReaderLoadError(error: unknown) {
+  if (isApryseLicenseError(error)) {
+    return 'Не удалось загрузить документ: [E_READER_LICENSE] Истёк пробный период Apryse WebViewer. Добавьте ключ в «Библиотека → Интерфейс → Лицензия Apryse».';
+  }
+
+  const info = toUiErrorInfo(error, 'E_READER_LOAD');
+  if (info.message && info.message !== 'Неизвестная ошибка') {
+    return `Не удалось загрузить документ: [${info.code}] ${info.message}`;
+  }
+
+  const unknown = error as any;
+  const detailCandidates = [
+    typeof unknown?.reason === 'string' ? unknown.reason : '',
+    typeof unknown?.details === 'string' ? unknown.details : '',
+    typeof unknown === 'string' ? unknown : '',
+  ].filter((item) => String(item).trim() && String(item).trim() !== '[object Object]');
+  const detail = detailCandidates[0] || 'PDF-движок вернул пустую ошибку при открытии файла.';
+
+  return `Не удалось загрузить документ: [E_READER_LOAD] ${detail}`;
 }
 
 function normalizeTemplateNote(current: string, templatePrefix: string): string {
@@ -521,6 +570,8 @@ async function navigateToPageWithRetry(instance: any, targetPageIndexRaw: number
 
 export const __readerTestUtils = {
   toArrayBuffer,
+  isApryseLicenseError,
+  formatReaderLoadError,
   selectionToRichText,
   normalizeHighlightPayload,
   colorLabel,
@@ -554,6 +605,7 @@ export function ReaderView({
   const { hostRef, instanceRef, viewerReady, viewerInitError, retryViewerInit } =
     useViewerLifecycle({
       toolbarGroup: TOOLBAR_GROUP,
+      licenseKey: settings.apryseLicenseKey,
     });
 
   const commitSelectionRef = useRef<(() => boolean) | null>(null);
@@ -610,6 +662,7 @@ export function ReaderView({
   const [selectedHighlightIds, setSelectedHighlightIds] = useState<string[]>([]);
 
   const currentDocumentIdRef = useRef(document.id);
+  const autoRestoreAttemptedRef = useRef(false);
 
   const activeColorRef = useRef<HighlightColor>('yellow');
   const lastCreatedSelectionRef = useRef<{
@@ -781,6 +834,7 @@ export function ReaderView({
 
   useEffect(() => {
     currentDocumentIdRef.current = document.id;
+    autoRestoreAttemptedRef.current = false;
   }, [document.id]);
 
   useEffect(() => {
@@ -1414,10 +1468,43 @@ export function ReaderView({
         setTotalPagesLocal(totalPages);
         setPageInput(String(targetPageIndex + 1));
         setLoading(false);
+        autoRestoreAttemptedRef.current = false;
         logAction('document-load-success', `action=${loadActionId} page=${targetPageIndex + 1}`);
       } catch (loadError: any) {
-        setError(formatErrorToast('Не удалось загрузить документ', loadError, 'E_READER_LOAD'));
-        logAction('document-load-error', formatErrorToast('', loadError, 'E_READER_LOAD'));
+        if (cancelled) {
+          return;
+        }
+        const isLicenseIssue = isApryseLicenseError(loadError);
+
+        if (!isLicenseIssue && !autoRestoreAttemptedRef.current) {
+          autoRestoreAttemptedRef.current = true;
+          try {
+            const restored = await restoreDocumentFromBackup(document.id);
+            if (cancelled) {
+              return;
+            }
+            if (restored?.restored) {
+              onNotifyRef.current('Документ восстановлен из бэкапа. Повторяем загрузку…', 'info');
+              logAction(
+                'document-load-auto-restore-success',
+                `file=${restored?.restoredFile ? 1 : 0} highlights=${Number(restored?.restoredHighlightsCount || 0)}`,
+              );
+              setError('');
+              setReloadNonce((value) => value + 1);
+              return;
+            }
+            logAction('document-load-auto-restore-miss', `reason=${restored?.reason || 'backup_not_found'}`);
+          } catch (restoreError) {
+            logAction(
+              'document-load-auto-restore-error',
+              formatErrorToast('', restoreError, 'E_READER_AUTO_RESTORE'),
+            );
+          }
+        }
+
+        const formattedError = formatReaderLoadError(loadError);
+        setError(formattedError);
+        logAction('document-load-error', formattedError);
         setLoading(false);
       } finally {
         loadingDocumentRef.current = false;
@@ -1532,12 +1619,20 @@ export function ReaderView({
 
   const activeProgress = useMemo(() => {
     const total = Math.max(0, totalPagesLocal);
-    const page = Math.max(0, currentPageLocal);
     if (!total) {
       return 0;
     }
-    return Math.round(((page + 1) / total) * 100);
-  }, [currentPageLocal, totalPagesLocal]);
+    const progressPageIndex = clamp(
+      Math.max(
+        Number(maxPageSeenRef.current || 0),
+        Number(document.maxReadPageIndex ?? document.lastReadPageIndex ?? 0),
+        Number(currentPageLocal || 0),
+      ),
+      0,
+      total - 1,
+    );
+    return Math.round(((progressPageIndex + 1) / total) * 100);
+  }, [currentPageLocal, document.lastReadPageIndex, document.maxReadPageIndex, totalPagesLocal]);
 
   const pendingSelectionPageLabel = useMemo(() => {
     if (pendingSelectionPage === null) {
@@ -1562,7 +1657,21 @@ export function ReaderView({
       documentId: document.id,
     });
   }, [document.id, visibleHighlights.length]);
-  const effectiveReaderError = error || viewerInitError;
+  const effectiveReaderError = useMemo(() => {
+    const raw = error || viewerInitError;
+    if (!raw) {
+      return '';
+    }
+    if (isApryseLicenseError(raw)) {
+      return formatReaderLoadError(raw);
+    }
+    return String(raw);
+  }, [error, viewerInitError]);
+  const effectiveReaderLicenseIssue = useMemo(
+    () => isApryseLicenseError(effectiveReaderError),
+    [effectiveReaderError],
+  );
+
   useEffect(() => {
     setDebugGauge('reader.loading', loading ? 1 : 0, 'reader', {
       documentId: document.id,
@@ -1588,6 +1697,7 @@ export function ReaderView({
   const maxReadPageIndex = useMemo(
     () =>
       Math.max(
+        Number(maxPageSeenRef.current || 0),
         Number(document.maxReadPageIndex ?? document.lastReadPageIndex ?? 0),
         Number(currentPageLocal || 0),
       ),
@@ -1881,8 +1991,49 @@ export function ReaderView({
 
   const retryDocumentLoad = () => {
     setError('');
+    autoRestoreAttemptedRef.current = false;
     setReloadNonce((value) => value + 1);
     logAction('document-retry');
+  };
+
+  const restoreDocumentLoadFromBackup = () => {
+    setError('');
+    setLoading(true);
+    autoRestoreAttemptedRef.current = true;
+    logAction('document-restore-manual-start');
+    void restoreDocumentFromBackup(document.id)
+      .then((restored) => {
+        if (!restored?.restored) {
+          const reason = restored?.reason ? ` (${restored.reason})` : '';
+          const message = `Не удалось восстановить документ из бэкапа${reason}.`;
+          setError(message);
+          setLoading(false);
+          logAction('document-restore-manual-miss', message);
+          return;
+        }
+
+        onNotifyRef.current(
+          `Восстановление завершено. Файл: ${restored.restoredFile ? 'восстановлен' : 'без изменений'}, хайлайтов: ${Number(
+            restored.restoredHighlightsCount || 0,
+          )}.`,
+          'success',
+        );
+        logAction(
+          'document-restore-manual-success',
+          `file=${restored?.restoredFile ? 1 : 0} highlights=${Number(restored?.restoredHighlightsCount || 0)}`,
+        );
+        setReloadNonce((value) => value + 1);
+      })
+      .catch((restoreError) => {
+        const message = formatErrorToast(
+          'Ошибка восстановления из бэкапа',
+          restoreError,
+          'E_READER_MANUAL_RESTORE',
+        );
+        setError(message);
+        setLoading(false);
+        logAction('document-restore-manual-error', message);
+      });
   };
 
   function handleReaderSideResizeStart(event: React.PointerEvent<HTMLDivElement>) {
@@ -2122,6 +2273,15 @@ export function ReaderView({
                   <button type="button" className="btn secondary" onClick={retryDocumentLoad}>
                     Повторить загрузку
                   </button>
+                  {effectiveReaderLicenseIssue ? (
+                    <button type="button" className="btn ghost" onClick={onBackToLibrary}>
+                      Открыть библиотеку
+                    </button>
+                  ) : (
+                    <button type="button" className="btn ghost" onClick={restoreDocumentLoadFromBackup}>
+                      Восстановить из бэкапа
+                    </button>
+                  )}
                   {viewerInitError ? (
                     <button type="button" className="btn ghost" onClick={retryViewerInit}>
                       Перезапустить движок

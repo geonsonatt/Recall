@@ -29,6 +29,37 @@ describe('ReaderView helper utils', () => {
     expect(() => readerUtils.toArrayBuffer({} as any)).toThrow('Неподдерживаемый формат PDF-данных.');
   });
 
+  it('formats opaque reader load errors with useful details', () => {
+    expect(
+      readerUtils.formatReaderLoadError({
+        code: 'E_FILE_READ',
+        message: 'Файл PDF не найден',
+      }),
+    ).toBe('Не удалось загрузить документ: [E_FILE_READ] Файл PDF не найден');
+
+    expect(
+      readerUtils.formatReaderLoadError({
+        reason: 'Invalid PDF data',
+      }),
+    ).toBe('Не удалось загрузить документ: [E_READER_LOAD] Invalid PDF data');
+
+    expect(readerUtils.formatReaderLoadError({})).toBe(
+      'Не удалось загрузить документ: [E_READER_LOAD] PDF-движок вернул пустую ошибку при открытии файла.',
+    );
+  });
+
+  it('detects Apryse license errors and returns dedicated message', () => {
+    const trialError = {
+      message:
+        '[E_READER_LOAD] Thank you for evaluating WebViewer! Your 7-day trial has expired.',
+    };
+
+    expect(readerUtils.isApryseLicenseError(trialError)).toBe(true);
+    expect(readerUtils.formatReaderLoadError(trialError)).toBe(
+      'Не удалось загрузить документ: [E_READER_LICENSE] Истёк пробный период Apryse WebViewer. Добавьте ключ в «Библиотека → Интерфейс → Лицензия Apryse».',
+    );
+  });
+
   it('extracts rich text from selection and falls back to plain text', () => {
     const host = document.createElement('div');
     host.innerHTML = '<p><b>Текст</b> <i>выделения</i></p>';

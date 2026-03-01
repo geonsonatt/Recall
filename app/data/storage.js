@@ -3,12 +3,16 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const DB_FILE_NAME = 'db.json';
+const BACKUP_DB_DIR_NAME = 'db';
+const BACKUP_DOCUMENTS_DIR_NAME = 'documents';
+const MAX_DOCUMENT_BACKUPS_PER_ID = 20;
 const ALLOWED_COLORS = new Set(['yellow', 'green', 'pink', 'blue', 'orange', 'purple']);
 const ALLOWED_THEMES = new Set(['white']);
 
 const DEFAULT_SETTINGS = {
   theme: 'white',
   focusMode: false,
+  apryseLicenseKey: undefined,
   goals: {
     pagesPerDay: 20,
     pagesPerWeek: 140,
@@ -256,6 +260,7 @@ function normalizeHighlight(highlight) {
     : 'yellow';
 
   const note = normalizeText(highlight?.note);
+  const documentTitle = normalizeText(highlight?.documentTitle).slice(0, 240);
   const selectedRichText = normalizeRichText(highlight?.selectedRichText);
   const selectedText =
     normalizeHighlightText(highlight?.selectedText) || richTextToPlainText(selectedRichText);
@@ -274,6 +279,7 @@ function normalizeHighlight(highlight) {
   return {
     id: String(highlight?.id ?? ''),
     documentId: String(highlight?.documentId ?? ''),
+    documentTitle: documentTitle || undefined,
     pageIndex: Math.max(0, Number(highlight?.pageIndex ?? 0) | 0),
     rects: Array.isArray(highlight?.rects)
       ? highlight.rects.map(normalizeRect).filter((rect) => rect.w > 0 && rect.h > 0)
@@ -480,10 +486,12 @@ function normalizeSettings(settings) {
     normalizedViews.length === 0
       ? normalizeSavedHighlightQueries(settings?.savedHighlightQueries)
       : convertViewsToSavedQueries(savedHighlightViews);
+  const apryseLicenseKey = normalizeText(settings?.apryseLicenseKey).slice(0, 4096) || undefined;
 
   return {
     theme: nextTheme,
     focusMode: Boolean(settings?.focusMode),
+    apryseLicenseKey,
     goals: {
       pagesPerDay,
       pagesPerWeek,
@@ -522,14 +530,57 @@ function normalizeReadingLog(readingLog) {
   return normalized;
 }
 
+function sanitizeBackupToken(value, fallback = 'snapshot') {
+  const normalized = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || fallback;
+}
+
+function backupOrderToken(fileName) {
+  const match = /^(\d+)/.exec(String(fileName || ''));
+  return match ? Number(match[1]) : 0;
+}
+
+function sortBackupFileNamesDesc(fileNames = []) {
+  return [...fileNames].sort((left, right) => {
+    const leftOrder = backupOrderToken(left);
+    const rightOrder = backupOrderToken(right);
+    if (leftOrder !== rightOrder) {
+      return rightOrder - leftOrder;
+    }
+    return String(right).localeCompare(String(left));
+  });
+}
+
 function normalizeDBShape(parsed) {
+  const documents = (Array.isArray(parsed?.documents) ? parsed.documents : [])
+    .map(normalizeDocument)
+    .filter((doc) => doc.id && doc.title && doc.filePath);
+  const documentTitleMap = new Map(documents.map((doc) => [doc.id, doc.title]));
+  const highlights = (Array.isArray(parsed?.highlights) ? parsed.highlights : [])
+    .map(normalizeHighlight)
+    .filter((highlight) => highlight.id && highlight.documentId)
+    .map((highlight) => {
+      if (highlight.documentTitle) {
+        return highlight;
+      }
+      const linkedTitle = documentTitleMap.get(highlight.documentId);
+      if (!linkedTitle) {
+        return highlight;
+      }
+      return {
+        ...highlight,
+        documentTitle: linkedTitle,
+      };
+    });
+
   return {
-    documents: (Array.isArray(parsed?.documents) ? parsed.documents : [])
-      .map(normalizeDocument)
-      .filter((doc) => doc.id && doc.title && doc.filePath),
-    highlights: (Array.isArray(parsed?.highlights) ? parsed.highlights : [])
-      .map(normalizeHighlight)
-      .filter((highlight) => highlight.id && highlight.documentId),
+    documents,
+    highlights,
     bookmarks: (Array.isArray(parsed?.bookmarks) ? parsed.bookmarks : [])
       .map(normalizeBookmark)
       .filter((bookmark) => bookmark.id && bookmark.documentId),
@@ -557,10 +608,273 @@ async function atomicWriteJson(filePath, value) {
   await fs.rename(tempFilePath, filePath);
 }
 
+async function pruneDocumentBackups(documentBackupDir, maxSnapshots = MAX_DOCUMENT_BACKUPS_PER_ID) {
+  const entries = await fs.readdir(documentBackupDir).catch(() => []);
+  const jsonFiles = sortBackupFileNamesDesc(
+    entries.filter((entry) => String(entry).toLowerCase().endsWith('.json')),
+  );
+
+  for (const staleJsonFile of jsonFiles.slice(Math.max(0, Number(maxSnapshots) | 0))) {
+    const baseName = staleJsonFile.slice(0, -5);
+    const jsonPath = path.join(documentBackupDir, staleJsonFile);
+    const pdfPath = path.join(documentBackupDir, `${baseName}.pdf`);
+    await Promise.all([
+      fs.rm(jsonPath, { force: true }),
+      fs.rm(pdfPath, { force: true }),
+    ]);
+  }
+}
+
+async function writeDocumentBackup(storagePaths, db, documentId, reason = 'snapshot') {
+  const id = String(documentId ?? '').trim();
+  if (!id) {
+    return null;
+  }
+
+  const document = db.documents.find((item) => item.id === id) || null;
+  const highlights = db.highlights.filter((item) => item.documentId === id);
+  const bookmarks = db.bookmarks.filter((item) => item.documentId === id);
+
+  if (!document && highlights.length === 0 && bookmarks.length === 0) {
+    return null;
+  }
+
+  const documentBackupDir = path.join(storagePaths.backupDir, BACKUP_DOCUMENTS_DIR_NAME, id);
+  await fs.mkdir(documentBackupDir, { recursive: true });
+
+  const stamp = String(Date.now());
+  const token = sanitizeBackupToken(reason, 'snapshot');
+  const baseName = `${stamp}-${token}`;
+  const payloadPath = path.join(documentBackupDir, `${baseName}.json`);
+  const payload = {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    reason: String(reason ?? 'snapshot'),
+    documentId: id,
+    document,
+    highlights,
+    bookmarks,
+  };
+
+  await atomicWriteJson(payloadPath, payload);
+
+  const candidatePdfPath = document?.filePath || path.join(storagePaths.documentsDir, `${id}.pdf`);
+  const hasPdfSource = await fileExists(candidatePdfPath);
+  if (hasPdfSource) {
+    await fs.copyFile(candidatePdfPath, path.join(documentBackupDir, `${baseName}.pdf`));
+  }
+
+  await pruneDocumentBackups(documentBackupDir);
+  return {
+    payloadPath,
+    pdfPath: hasPdfSource ? path.join(documentBackupDir, `${baseName}.pdf`) : undefined,
+    documentId: id,
+  };
+}
+
+async function writeDocumentBackupSafe(storagePaths, db, documentId, reason = 'snapshot') {
+  try {
+    return await writeDocumentBackup(storagePaths, db, documentId, reason);
+  } catch {
+    return null;
+  }
+}
+
+async function readLatestDocumentBackup(storagePaths, documentId) {
+  const id = String(documentId ?? '').trim();
+  if (!id) {
+    return null;
+  }
+
+  const documentBackupDir = path.join(storagePaths.backupDir, BACKUP_DOCUMENTS_DIR_NAME, id);
+  const entries = await fs.readdir(documentBackupDir).catch(() => []);
+  const jsonFiles = sortBackupFileNamesDesc(
+    entries.filter((entry) => String(entry).toLowerCase().endsWith('.json')),
+  );
+
+  for (const jsonFileName of jsonFiles) {
+    const payloadPath = path.join(documentBackupDir, jsonFileName);
+    const baseName = jsonFileName.slice(0, -5);
+    const pdfPath = path.join(documentBackupDir, `${baseName}.pdf`);
+
+    try {
+      const raw = await fs.readFile(payloadPath, 'utf8');
+      const payload = JSON.parse(raw);
+      if (!payload || typeof payload !== 'object') {
+        continue;
+      }
+      return {
+        payloadPath,
+        payload,
+        pdfPath: (await fileExists(pdfPath)) ? pdfPath : undefined,
+      };
+    } catch {
+      // Skip broken snapshot and continue to previous backup.
+    }
+  }
+
+  return null;
+}
+
+async function readLatestDocumentBackupWithPdf(storagePaths, documentId) {
+  const id = String(documentId ?? '').trim();
+  if (!id) {
+    return null;
+  }
+
+  const documentBackupDir = path.join(storagePaths.backupDir, BACKUP_DOCUMENTS_DIR_NAME, id);
+  const entries = await fs.readdir(documentBackupDir).catch(() => []);
+  const jsonFiles = sortBackupFileNamesDesc(
+    entries.filter((entry) => String(entry).toLowerCase().endsWith('.json')),
+  );
+
+  for (const jsonFileName of jsonFiles) {
+    const payloadPath = path.join(documentBackupDir, jsonFileName);
+    const baseName = jsonFileName.slice(0, -5);
+    const pdfPath = path.join(documentBackupDir, `${baseName}.pdf`);
+    if (!(await fileExists(pdfPath))) {
+      continue;
+    }
+
+    try {
+      const raw = await fs.readFile(payloadPath, 'utf8');
+      const payload = JSON.parse(raw);
+      if (!payload || typeof payload !== 'object') {
+        continue;
+      }
+      return {
+        payloadPath,
+        payload,
+        pdfPath,
+      };
+    } catch {
+      // Skip broken snapshot and continue to previous backup.
+    }
+  }
+
+  return null;
+}
+
+async function readLatestDocumentBackupWithDocument(storagePaths, documentId) {
+  const id = String(documentId ?? '').trim();
+  if (!id) {
+    return null;
+  }
+
+  const documentBackupDir = path.join(storagePaths.backupDir, BACKUP_DOCUMENTS_DIR_NAME, id);
+  const entries = await fs.readdir(documentBackupDir).catch(() => []);
+  const jsonFiles = sortBackupFileNamesDesc(
+    entries.filter((entry) => String(entry).toLowerCase().endsWith('.json')),
+  );
+
+  for (const jsonFileName of jsonFiles) {
+    const payloadPath = path.join(documentBackupDir, jsonFileName);
+    const baseName = jsonFileName.slice(0, -5);
+    const pdfPath = path.join(documentBackupDir, `${baseName}.pdf`);
+
+    try {
+      const raw = await fs.readFile(payloadPath, 'utf8');
+      const payload = JSON.parse(raw);
+      if (!payload || typeof payload !== 'object' || !payload.document) {
+        continue;
+      }
+      return {
+        payloadPath,
+        payload,
+        pdfPath: (await fileExists(pdfPath)) ? pdfPath : undefined,
+      };
+    } catch {
+      // Skip broken snapshot and continue to previous backup.
+    }
+  }
+
+  return null;
+}
+
+async function readLatestDocumentBackupWithHighlights(storagePaths, documentId) {
+  const id = String(documentId ?? '').trim();
+  if (!id) {
+    return null;
+  }
+
+  const documentBackupDir = path.join(storagePaths.backupDir, BACKUP_DOCUMENTS_DIR_NAME, id);
+  const entries = await fs.readdir(documentBackupDir).catch(() => []);
+  const jsonFiles = sortBackupFileNamesDesc(
+    entries.filter((entry) => String(entry).toLowerCase().endsWith('.json')),
+  );
+
+  for (const jsonFileName of jsonFiles) {
+    const payloadPath = path.join(documentBackupDir, jsonFileName);
+    const baseName = jsonFileName.slice(0, -5);
+    const pdfPath = path.join(documentBackupDir, `${baseName}.pdf`);
+
+    try {
+      const raw = await fs.readFile(payloadPath, 'utf8');
+      const payload = JSON.parse(raw);
+      if (!payload || typeof payload !== 'object') {
+        continue;
+      }
+      if (!Array.isArray(payload.highlights) || payload.highlights.length === 0) {
+        continue;
+      }
+      return {
+        payloadPath,
+        payload,
+        pdfPath: (await fileExists(pdfPath)) ? pdfPath : undefined,
+      };
+    } catch {
+      // Skip broken snapshot and continue to previous backup.
+    }
+  }
+
+  return null;
+}
+
+async function readLatestDocumentBackupWithBookmarks(storagePaths, documentId) {
+  const id = String(documentId ?? '').trim();
+  if (!id) {
+    return null;
+  }
+
+  const documentBackupDir = path.join(storagePaths.backupDir, BACKUP_DOCUMENTS_DIR_NAME, id);
+  const entries = await fs.readdir(documentBackupDir).catch(() => []);
+  const jsonFiles = sortBackupFileNamesDesc(
+    entries.filter((entry) => String(entry).toLowerCase().endsWith('.json')),
+  );
+
+  for (const jsonFileName of jsonFiles) {
+    const payloadPath = path.join(documentBackupDir, jsonFileName);
+    const baseName = jsonFileName.slice(0, -5);
+    const pdfPath = path.join(documentBackupDir, `${baseName}.pdf`);
+
+    try {
+      const raw = await fs.readFile(payloadPath, 'utf8');
+      const payload = JSON.parse(raw);
+      if (!payload || typeof payload !== 'object') {
+        continue;
+      }
+      if (!Array.isArray(payload.bookmarks) || payload.bookmarks.length === 0) {
+        continue;
+      }
+      return {
+        payloadPath,
+        payload,
+        pdfPath: (await fileExists(pdfPath)) ? pdfPath : undefined,
+      };
+    } catch {
+      // Skip broken snapshot and continue to previous backup.
+    }
+  }
+
+  return null;
+}
+
 async function ensureStorage(userDataPath) {
   const documentsDir = path.join(userDataPath, 'documents');
   const exportsDir = path.join(userDataPath, 'exports');
   const backupDir = path.join(userDataPath, 'backups');
+  const backupDocumentsDir = path.join(backupDir, BACKUP_DOCUMENTS_DIR_NAME);
+  const backupDbDir = path.join(backupDir, BACKUP_DB_DIR_NAME);
   const dbPath = path.join(userDataPath, DB_FILE_NAME);
 
   await Promise.all([
@@ -568,6 +882,8 @@ async function ensureStorage(userDataPath) {
     fs.mkdir(documentsDir, { recursive: true }),
     fs.mkdir(exportsDir, { recursive: true }),
     fs.mkdir(backupDir, { recursive: true }),
+    fs.mkdir(backupDocumentsDir, { recursive: true }),
+    fs.mkdir(backupDbDir, { recursive: true }),
   ]);
 
   if (!(await fileExists(dbPath))) {
@@ -901,6 +1217,13 @@ async function addHighlight(storagePaths, highlight) {
   const db = await loadDB(storagePaths);
   const normalizedHighlight = normalizeHighlight(highlight);
 
+  if (!normalizedHighlight.documentTitle) {
+    const linkedDocument = db.documents.find((document) => document.id === normalizedHighlight.documentId);
+    if (linkedDocument?.title) {
+      normalizedHighlight.documentTitle = linkedDocument.title;
+    }
+  }
+
   if (!normalizedHighlight.selectedText) {
     throw new Error('Текст выделения пуст.');
   }
@@ -910,6 +1233,7 @@ async function addHighlight(storagePaths, highlight) {
   }
 
   db.highlights.push(normalizedHighlight);
+  await writeDocumentBackupSafe(storagePaths, db, normalizedHighlight.documentId, 'after-highlight-add');
   await saveDB(storagePaths, db);
 
   return normalizedHighlight;
@@ -956,8 +1280,15 @@ async function updateHighlight(storagePaths, highlightId, patch) {
   if (!Array.isArray(merged.rects) || merged.rects.length === 0) {
     merged.rects = existing.rects;
   }
+  if (!merged.documentTitle) {
+    merged.documentTitle =
+      existing.documentTitle ||
+      db.documents.find((document) => document.id === existing.documentId)?.title ||
+      undefined;
+  }
 
   db.highlights[index] = merged;
+  await writeDocumentBackupSafe(storagePaths, db, existing.documentId, 'after-highlight-update');
   await saveDB(storagePaths, db);
   return merged;
 }
@@ -974,6 +1305,16 @@ async function deleteHighlightsByIds(storagePaths, highlightIds = []) {
 
   const db = await loadDB(storagePaths);
   const idSet = new Set(ids);
+  const affectedDocumentIds = [
+    ...new Set(
+      db.highlights
+        .filter((item) => idSet.has(item.id))
+        .map((item) => item.documentId),
+    ),
+  ];
+  for (const documentId of affectedDocumentIds) {
+    await writeDocumentBackupSafe(storagePaths, db, documentId, 'before-highlight-delete');
+  }
   const nextHighlights = db.highlights.filter((item) => !idSet.has(item.id));
   const deletedCount = db.highlights.length - nextHighlights.length;
 
@@ -1001,6 +1342,7 @@ async function addBookmark(storagePaths, bookmark) {
   }
 
   db.bookmarks.push(normalized);
+  await writeDocumentBackupSafe(storagePaths, db, normalized.documentId, 'after-bookmark-add');
   await saveDB(storagePaths, db);
   return normalized;
 }
@@ -1023,6 +1365,7 @@ async function updateBookmark(storagePaths, bookmarkId, patch = {}) {
   });
 
   db.bookmarks[index] = merged;
+  await writeDocumentBackupSafe(storagePaths, db, existing.documentId, 'after-bookmark-update');
   await saveDB(storagePaths, db);
   return merged;
 }
@@ -1030,6 +1373,10 @@ async function updateBookmark(storagePaths, bookmarkId, patch = {}) {
 async function deleteBookmark(storagePaths, bookmarkId) {
   const id = String(bookmarkId ?? '');
   const db = await loadDB(storagePaths);
+  const target = db.bookmarks.find((bookmark) => bookmark.id === id);
+  if (target?.documentId) {
+    await writeDocumentBackupSafe(storagePaths, db, target.documentId, 'before-bookmark-delete');
+  }
   const nextBookmarks = db.bookmarks.filter((bookmark) => bookmark.id !== id);
   if (nextBookmarks.length === db.bookmarks.length) {
     return { deleted: false };
@@ -1048,6 +1395,16 @@ async function deleteBookmarksByIds(storagePaths, bookmarkIds = []) {
 
   const idSet = new Set(ids);
   const db = await loadDB(storagePaths);
+  const affectedDocumentIds = [
+    ...new Set(
+      db.bookmarks
+        .filter((bookmark) => idSet.has(bookmark.id))
+        .map((bookmark) => bookmark.documentId),
+    ),
+  ];
+  for (const documentId of affectedDocumentIds) {
+    await writeDocumentBackupSafe(storagePaths, db, documentId, 'before-bookmark-delete-many');
+  }
   const nextBookmarks = db.bookmarks.filter((bookmark) => !idSet.has(bookmark.id));
   const deletedCount = db.bookmarks.length - nextBookmarks.length;
 
@@ -1182,28 +1539,180 @@ async function deleteDocument(storagePaths, documentId) {
     return { deleted: false };
   }
 
+  await writeDocumentBackupSafe(storagePaths, db, id, 'before-document-delete');
+
   const [removedDocument] = db.documents.splice(index, 1);
-  const beforeHighlightsCount = db.highlights.length;
-  const beforeBookmarksCount = db.bookmarks.length;
-  db.highlights = db.highlights.filter((item) => item.documentId !== id);
-  db.bookmarks = db.bookmarks.filter((item) => item.documentId !== id);
-  const removedHighlightsCount = beforeHighlightsCount - db.highlights.length;
-  const removedBookmarksCount = beforeBookmarksCount - db.bookmarks.length;
+  const detachedHighlightsCount = db.highlights.filter((item) => item.documentId === id).length;
+  const detachedBookmarksCount = db.bookmarks.filter((item) => item.documentId === id).length;
+
+  if (removedDocument?.title && detachedHighlightsCount > 0) {
+    db.highlights = db.highlights.map((item) => {
+      if (item.documentId !== id || normalizeText(item.documentTitle)) {
+        return item;
+      }
+      return {
+        ...item,
+        documentTitle: removedDocument.title,
+      };
+    });
+  }
 
   await saveDB(storagePaths, db);
 
   const documentFilePath =
     removedDocument?.filePath || path.join(storagePaths.documentsDir, `${id}.pdf`);
 
-  fs.unlink(documentFilePath).catch(() => {
+  try {
+    await fs.unlink(documentFilePath);
+  } catch {
     // Ignore filesystem errors for missing/locked file to keep DB consistent.
-  });
+  }
 
   return {
     deleted: true,
     documentId: id,
-    removedHighlightsCount,
-    removedBookmarksCount,
+    removedHighlightsCount: 0,
+    removedBookmarksCount: 0,
+    detachedHighlightsCount,
+    detachedBookmarksCount,
+  };
+}
+
+async function restoreDocumentFromBackup(storagePaths, documentId, options = {}) {
+  const id = String(documentId ?? '').trim();
+  if (!id) {
+    throw new Error('Не передан идентификатор документа.');
+  }
+
+  const latest = await readLatestDocumentBackup(storagePaths, id);
+  if (!latest) {
+    return {
+      restored: false,
+      documentId: id,
+      reason: 'backup_not_found',
+    };
+  }
+
+  let snapshotForRestore = latest;
+  let payload =
+    snapshotForRestore.payload && typeof snapshotForRestore.payload === 'object'
+      ? snapshotForRestore.payload
+      : {};
+  let backupDocument = payload.document && typeof payload.document === 'object' ? payload.document : null;
+  let backupHighlights = Array.isArray(payload.highlights) ? payload.highlights : [];
+  let backupBookmarks = Array.isArray(payload.bookmarks) ? payload.bookmarks : [];
+
+  if (!backupDocument) {
+    const withDocument = await readLatestDocumentBackupWithDocument(storagePaths, id);
+    if (withDocument?.payload?.document) {
+      backupDocument = withDocument.payload.document;
+    }
+  }
+  if (backupHighlights.length === 0) {
+    const withHighlights = await readLatestDocumentBackupWithHighlights(storagePaths, id);
+    if (Array.isArray(withHighlights?.payload?.highlights) && withHighlights.payload.highlights.length > 0) {
+      backupHighlights = withHighlights.payload.highlights;
+    }
+  }
+  if (backupBookmarks.length === 0) {
+    const withBookmarks = await readLatestDocumentBackupWithBookmarks(storagePaths, id);
+    if (Array.isArray(withBookmarks?.payload?.bookmarks) && withBookmarks.payload.bookmarks.length > 0) {
+      backupBookmarks = withBookmarks.payload.bookmarks;
+    }
+  }
+
+  const db = await loadDB(storagePaths);
+  const existingDocument = db.documents.find((item) => item.id === id) || null;
+
+  const fallbackTitle =
+    normalizeText(backupDocument?.title) ||
+    normalizeText(backupHighlights[0]?.documentTitle) ||
+    normalizeText(existingDocument?.title) ||
+    `Документ ${id.slice(0, 8)}`;
+  const destinationPdfPath =
+    String(existingDocument?.filePath || backupDocument?.filePath || '').trim() ||
+    path.join(storagePaths.documentsDir, `${id}.pdf`);
+
+  let restoredFile = false;
+  const needsPdfRestore = !(await fileExists(destinationPdfPath));
+  let snapshotForPdf = snapshotForRestore;
+  if (needsPdfRestore && !snapshotForPdf.pdfPath) {
+    snapshotForPdf = (await readLatestDocumentBackupWithPdf(storagePaths, id)) || snapshotForRestore;
+  }
+  if (needsPdfRestore && snapshotForPdf?.payload) {
+    snapshotForRestore = snapshotForPdf;
+    payload =
+      snapshotForRestore.payload && typeof snapshotForRestore.payload === 'object'
+        ? snapshotForRestore.payload
+        : payload;
+  }
+  if (needsPdfRestore && snapshotForPdf.pdfPath) {
+    await fs.mkdir(path.dirname(destinationPdfPath), { recursive: true });
+    await fs.copyFile(snapshotForPdf.pdfPath, destinationPdfPath);
+    restoredFile = true;
+  }
+
+  const restoredDocument = normalizeDocument({
+    ...backupDocument,
+    ...existingDocument,
+    id,
+    title: fallbackTitle,
+    filePath: destinationPdfPath,
+    createdAt: backupDocument?.createdAt || existingDocument?.createdAt || new Date().toISOString(),
+  });
+
+  const documentIndex = db.documents.findIndex((item) => item.id === id);
+  if (documentIndex >= 0) {
+    const originalCreatedAt = db.documents[documentIndex].createdAt;
+    db.documents[documentIndex] = {
+      ...db.documents[documentIndex],
+      ...restoredDocument,
+      createdAt: originalCreatedAt,
+    };
+  } else {
+    db.documents.push(restoredDocument);
+  }
+
+  const shouldRestoreAnnotations = options?.restoreAnnotations !== false;
+  let restoredHighlightsCount = 0;
+  let restoredBookmarksCount = 0;
+  if (shouldRestoreAnnotations) {
+    const normalizedHighlights = backupHighlights
+      .map((item) =>
+        normalizeHighlight({
+          ...item,
+          documentId: id,
+          documentTitle: normalizeText(item?.documentTitle) || fallbackTitle,
+        }),
+      )
+      .filter((item) => item.id && item.documentId === id);
+    const normalizedBookmarks = backupBookmarks
+      .map((item) =>
+        normalizeBookmark({
+          ...item,
+          documentId: id,
+        }),
+      )
+      .filter((item) => item.id && item.documentId === id);
+
+    db.highlights = db.highlights.filter((item) => item.documentId !== id);
+    db.bookmarks = db.bookmarks.filter((item) => item.documentId !== id);
+    db.highlights.push(...normalizedHighlights);
+    db.bookmarks.push(...normalizedBookmarks);
+    restoredHighlightsCount = normalizedHighlights.length;
+    restoredBookmarksCount = normalizedBookmarks.length;
+  }
+
+  await saveDB(storagePaths, db);
+  const document = await getDocumentById(storagePaths, id);
+  return {
+    restored: true,
+    documentId: id,
+    document,
+    restoredFile,
+    restoredHighlightsCount,
+    restoredBookmarksCount,
+    backupPath: snapshotForRestore.payloadPath,
   };
 }
 
@@ -1212,7 +1721,30 @@ async function computeSha256(filePath) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
-async function importDocumentFromPath(storagePaths, sourceFilePath) {
+async function ensureReadablePdfSource(sourceFilePath) {
+  const normalizedPath = String(sourceFilePath ?? '').trim();
+  if (!normalizedPath) {
+    throw new Error('Не передан путь к PDF-файлу.');
+  }
+
+  const resolvedPath = path.resolve(normalizedPath);
+  const sourceStats = await fs
+    .stat(resolvedPath)
+    .catch(() => null);
+
+  if (!sourceStats || !sourceStats.isFile()) {
+    throw new Error('Файл для импорта не найден.');
+  }
+
+  if (path.extname(resolvedPath).toLowerCase() !== '.pdf') {
+    throw new Error('Поддерживается только импорт PDF-файлов.');
+  }
+
+  return resolvedPath;
+}
+
+async function importDocumentFromPath(storagePaths, sourceFilePathRaw) {
+  const sourceFilePath = await ensureReadablePdfSource(sourceFilePathRaw);
   const id = await computeSha256(sourceFilePath);
   const destinationPath = path.join(storagePaths.documentsDir, `${id}.pdf`);
 
@@ -1250,6 +1782,7 @@ async function importDocumentFromPath(storagePaths, sourceFilePath) {
   });
 
   db.documents.push(document);
+  await writeDocumentBackupSafe(storagePaths, db, document.id, 'after-import');
   await saveDB(storagePaths, db);
 
   return {
@@ -1325,6 +1858,7 @@ module.exports = {
   updateSettings,
   getReadingOverview,
   deleteDocument,
+  restoreDocumentFromBackup,
   importDocumentFromPath,
   importDocumentsFromPaths,
   getStoragePaths,
